@@ -1300,5 +1300,6 @@ class LossConfig(Config):
 
     def build(self) -> Loss:
         """Build a Loss from the config."""
-        loss_key = self.loss_config.pop("type")
-        return LOSS_REGISTRY.get_class(loss_key)(**self.loss_config)
+        config = self.loss_config.copy()
+        loss_key = config.pop("type")
+        return LOSS_REGISTRY.get_class(loss_key)(**config)
