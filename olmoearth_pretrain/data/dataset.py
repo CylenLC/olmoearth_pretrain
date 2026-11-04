@@ -6,8 +6,9 @@ import hashlib
 import logging
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
+from urllib.parse import urlsplit
 
 import h5py
 
@@ -539,8 +540,8 @@ class OlmoEarthDataset(Dataset):
         Updates the sample indices numpy array to only include the indices we want to train on.
         """
         # Read the metadata CSV
-        # TODO: Pandas can't read gcs upaths
-        metadata_df = pd.read_csv(str(self.sample_metadata_path))
+        with self.sample_metadata_path.open("rb") as metadata_file:
+            metadata_df = pd.read_csv(metadata_file)
         logger.info(f"Metadata CSV has {len(metadata_df)} samples")
         logger.info(f"columns: {metadata_df.columns}")
 
@@ -981,6 +982,52 @@ class OlmoEarthDataset(Dataset):
 
 
 @dataclass
+class OSSConfig(Config):
+    """Non-secret OSS S3 connection settings; credentials use the AWS provider chain.
+
+    UPath serializes these settings, not an open client or HDF5 handle. Spawned
+    workers create their own filesystem/client lazily. Never supply credentials
+    in this config: training configs are saved in logs and checkpoints.
+    """
+
+    endpoint_url: str | None = None
+    region: str | None = None
+    profile: str | None = None
+
+    def storage_options(self) -> dict[str, Any]:
+        """Build options for OSS's virtual-hosted, S3 V2 read interface."""
+        endpoint = urlsplit(self.endpoint_url or "")
+        if (
+            endpoint.scheme != "https"
+            or not endpoint.hostname
+            or endpoint.username is not None
+            or endpoint.password is not None
+            or endpoint.query
+            or endpoint.fragment
+            or endpoint.path not in ("", "/")
+        ):
+            raise ValueError("OSS endpoint must be an HTTPS origin without credentials")
+        if not self.region:
+            raise ValueError("OSS region must be provided")
+        options: dict[str, Any] = {
+            "client_kwargs": {
+                "endpoint_url": self.endpoint_url,
+                "region_name": self.region,
+            },
+            "config_kwargs": {
+                "signature_version": "s3",
+                "s3": {"addressing_style": "virtual"},
+                "connect_timeout": 10,
+                "read_timeout": 60,
+                "retries": {"mode": "standard", "max_attempts": 3},
+            },
+        }
+        if self.profile is not None:
+            options["profile"] = self.profile
+        return options
+
+
+@dataclass
 class OlmoEarthDatasetConfig(Config):
     """Configuration for the OlmoEarthDataset."""
 
@@ -994,6 +1041,7 @@ class OlmoEarthDatasetConfig(Config):
     seed: int = 0
     apply_cutmix: bool = False
     filter_idx_file: str | None = None
+    oss: OSSConfig = field(default_factory=OSSConfig)
 
     def get_numpy_dtype(self) -> np.dtype:
         """Get the numpy dtype."""
@@ -1020,6 +1068,10 @@ class OlmoEarthDatasetConfig(Config):
     @property
     def h5py_dir_upath(self) -> UPath:
         """Get the h5py directory."""
+        if any((self.oss.endpoint_url, self.oss.region, self.oss.profile)):
+            if not self.h5py_dir.startswith("s3://"):
+                raise ValueError("OSS settings require an s3:// HDF5 directory")
+            return UPath(self.h5py_dir, **self.oss.storage_options())
         return UPath(self.h5py_dir)
 
     @property
@@ -1031,6 +1083,7 @@ class OlmoEarthDatasetConfig(Config):
         """Build the dataset."""
         self.validate()
         kwargs = self.as_dict(exclude_none=True, recurse=False)
+        kwargs.pop("oss", None)
         kwargs["h5py_dir"] = self.h5py_dir_upath
         kwargs["cache_dir"] = (
             self.cache_dir_upath if self.cache_dir is not None else None
