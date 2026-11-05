@@ -4,6 +4,7 @@ import importlib
 from logging import getLogger
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 import torch
@@ -15,11 +16,15 @@ from olmoearth_pretrain.data.constants import (
     Modality,
 )
 from olmoearth_pretrain.data.dataset import (
+    GetItemArgs,
     OlmoEarthDataset,
     OlmoEarthSample,
     get_valid_start_ts,
+    one_hot_worldcover,
+    subset_sample_cutmix,
     subset_sample_default,
 )
+from olmoearth_pretrain.dataset.convert_to_h5py import ConvertToH5py
 
 logger = getLogger(__name__)
 
@@ -49,6 +54,85 @@ def test_collate_olmoearth_pretrain(
     # Check the missing modality mask values
     assert torch.all(collated_sample[1].sentinel1[1] == MISSING_VALUE)
     assert torch.all(collated_sample[1].worldcover[2] == MISSING_VALUE)
+
+
+@pytest.mark.parametrize("apply_cutmix", [False, True])
+@pytest.mark.parametrize("normalize", [False, True])
+def test_hdf5_sample_matches_dense_missing_timestep_reference(
+    tmp_path: Path, apply_cutmix: bool, normalize: bool
+) -> None:
+    """Check values, dtypes and RNG against dense arrays and the legacy normalize step."""
+    s1, s2, worldcover = "sentinel1", "sentinel2_l2a", "worldcover_onehot"
+    dataset = OlmoEarthDataset(
+        h5py_dir=UPath(tmp_path),
+        training_modalities=[s1, s2, worldcover],
+        dtype=np.float32,
+        max_sequence_length=4,
+        normalize=normalize,
+        apply_cutmix=apply_cutmix,
+    )
+    timestamps = np.array([[1, month, 2020] for month in range(1, 5)])
+    compact = np.arange(8 * 8 * 2 * 2, dtype=np.int16).reshape(8, 8, 2, 2)
+    bands = Modality.SENTINEL2_L2A.num_bands
+    complete = np.arange(8 * 8 * 4 * bands, dtype=np.float32).reshape(8, 8, 4, bands)
+    complete[..., 0] = MISSING_VALUE
+    classes = np.full((8, 8, 1, 1), 10, dtype=np.int32)
+    classes[::2] = MISSING_VALUE
+    masks = {
+        s1: np.array([True, False, True, False]),
+        s2: np.ones(4, dtype=bool),
+    }
+    with h5py.File(str(dataset._get_h5_file_path(0)), "w") as file:
+        file["timestamps"] = timestamps
+        file[s1] = compact
+        file[s2] = complete
+        file["worldcover"] = classes
+        group = file.create_group(ConvertToH5py.missing_timesteps_mask_group_name)
+        for name, mask in masks.items():
+            group[name] = mask
+
+    dense = np.full((8, 8, 4, 2), MISSING_VALUE, dtype=np.float32)
+    dense[:, :, 0] = compact[:, :, 0]
+    dense[:, :, 2] = compact[:, :, 1]
+    sample = OlmoEarthSample(
+        timestamps=timestamps,
+        sentinel1=dense,
+        sentinel2_l2a=complete,
+        worldcover_onehot=one_hot_worldcover(classes, np.dtype(np.float32)),
+    )
+    args = GetItemArgs(0, 2, 2, token_budget=1000, target_t=3)
+    subset = subset_sample_cutmix if apply_cutmix else subset_sample_default
+    rng = np.random.get_state()
+    try:
+        np.random.seed(3622)
+        expected = subset(
+            sample,
+            patch_size=args.patch_size,
+            max_tokens_per_instance=args.token_budget,
+            sampled_hw_p=args.sampled_hw_p,
+            current_length=len(timestamps),
+            missing_timesteps_masks=masks,
+            target_t=args.target_t,
+        ).as_dict()
+        expected_rng = np.random.get_state()
+        if normalize:
+            for name in (s1, s2, worldcover):
+                raw = expected[name]
+                norm = dataset.normalize_image(Modality.get(name), raw)
+                expected[name] = np.where(raw == MISSING_VALUE, raw, norm).astype(
+                    np.float32
+                )
+
+        np.random.seed(3622)
+        patch_size, actual = dataset[args]
+        np.testing.assert_equal(np.random.get_state(), expected_rng)
+        assert patch_size == args.patch_size
+        assert actual.as_dict().keys() == expected.keys()
+        for name, array in actual.as_dict().items():
+            assert array.dtype == expected[name].dtype
+            np.testing.assert_array_equal(array, expected[name], err_msg=name)
+    finally:
+        np.random.set_state(rng)
 
 
 class TestOlmoEarthSample:

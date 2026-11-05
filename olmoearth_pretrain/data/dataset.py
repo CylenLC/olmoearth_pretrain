@@ -783,8 +783,6 @@ class OlmoEarthDataset(Dataset):
         missing_timestep_mask: np.ndarray,
     ) -> np.ndarray:
         """Fill the missing timesteps with the missing value."""
-        # cast to appropriate dtype to prevent overflow from missing values
-        modality_data = modality_data.astype(self.dtype)
         # Get the shape of the data to create properly sized temporal layers
         h, w, t, c = modality_data.shape
 
@@ -794,7 +792,7 @@ class OlmoEarthDataset(Dataset):
             dtype=self.dtype,
         )
 
-        # Copy the existing data to the appropriate timestep positions
+        # Assignment casts directly to the destination dtype.
         present_indices = np.where(missing_timestep_mask)[0]
         num_to_copy = min(len(present_indices), t)
         if num_to_copy > 0:
@@ -861,8 +859,6 @@ class OlmoEarthDataset(Dataset):
             if modality in missing_timesteps_masks:
                 mask = missing_timesteps_masks[modality]
                 modality_data = sample_dict[modality]
-                # cast to appropriate dtype to prevent overflow from missing values
-                modality_data = modality_data.astype(self.dtype)
 
                 # As long as the #timesteps is less than the max_sequence_length, we will impute by missing value
                 has_missing_timesteps = (
@@ -871,6 +867,8 @@ class OlmoEarthDataset(Dataset):
                 if has_missing_timesteps:
                     # By default, we will fill missing timesteps with the missing value
                     modality_data = self._fill_missing_timesteps(modality_data, mask)
+                else:
+                    modality_data = modality_data.astype(self.dtype, copy=False)
                 # Update the sample dictionary with the potentially imputed data
                 sample_dict[modality] = modality_data
         return OlmoEarthSample(**sample_dict), missing_modalities
@@ -1064,14 +1062,22 @@ class OlmoEarthDataset(Dataset):
                     continue
                 logger.debug(f"Normalizing {modality_name}")
                 modality_data = sample_dict[modality_name]
-                missing_mask = modality_data == MISSING_VALUE
                 normalized_data = self.normalize_image(
                     Modality.get(modality_name), modality_data
                 )
-                # Sentinel Values must be reset after normalization so they can be recognized by missing mask
-                sample_dict[modality_name] = np.where(
-                    missing_mask, modality_data, normalized_data
-                ).astype(self.dtype)
+                if normalized_data is modality_data:
+                    # Keep the cropped result independent of its full tile.
+                    sample_dict[modality_name] = modality_data.astype(self.dtype)
+                else:
+                    # Restore sentinel values in the normalization result itself.
+                    np.copyto(
+                        normalized_data,
+                        modality_data,
+                        where=modality_data == MISSING_VALUE,
+                    )
+                    sample_dict[modality_name] = normalized_data.astype(
+                        self.dtype, copy=False
+                    )
 
         return args.patch_size, OlmoEarthSample(**sample_dict)
 
