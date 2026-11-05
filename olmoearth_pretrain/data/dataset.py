@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
+import os
 import shutil
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 from urllib.parse import urlsplit
@@ -40,6 +44,51 @@ from olmoearth_pretrain.nn.tokenization import TokenizationConfig
 from olmoearth_pretrain.types import ArrayTensor
 
 logger = logging.getLogger(__name__)
+
+_oss_clients = threading.local()
+
+
+@contextmanager
+def _open_h5_file(path: UPath):
+    """Read Alibaba OSS objects completely, retaining normal UPath behavior elsewhere."""
+    options = path.storage_options
+    client_options = dict(options.get("client_kwargs", {}))
+    endpoint = client_options.get("endpoint_url") or ""
+    host = urlsplit(endpoint).hostname or ""
+    if path.protocol != "s3" or not host.endswith(".aliyuncs.com"):
+        with path.open("rb") as stream:
+            yield stream
+        return
+
+    # Clients are created lazily in the worker that uses them, never pickled.
+    import boto3
+    from botocore.config import Config as BotoConfig
+
+    profile = options.get("profile")
+    config_options = dict(options.get("config_kwargs", {}))
+    signature = (os.getpid(), profile, client_options, config_options)
+    if getattr(_oss_clients, "signature", None) != signature:
+        old_client = getattr(_oss_clients, "client", None)
+        if old_client is not None:
+            old_client.close()
+        session = boto3.Session(profile_name=profile)
+        _oss_clients.client = session.client(
+            "s3", config=BotoConfig(**config_options), **client_options
+        )
+        _oss_clients.signature = signature
+    object_url = urlsplit(str(path))
+    response = _oss_clients.client.get_object(
+        Bucket=object_url.netloc, Key=object_url.path.lstrip("/")
+    )
+    body = response["Body"]
+    try:
+        payload = body.read()
+    finally:
+        body.close()
+    if len(payload) != response["ContentLength"]:
+        raise OSError("OSS response body length does not match ContentLength")
+    with io.BytesIO(payload) as stream:
+        yield stream
 
 
 # =============================================================================
@@ -832,7 +881,7 @@ class OlmoEarthDataset(Dataset):
             self._apply_throttling()
 
         sample_dict = {}
-        with h5_file_path.open("rb") as f:
+        with _open_h5_file(h5_file_path) as f:
             with h5py.File(f, "r") as h5file:
                 logger.debug(
                     f"Reading h5 file {h5_file_path} with keys {h5file.keys()}"

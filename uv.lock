@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.11, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
@@ -2510,6 +2510,7 @@ flash-attn = [
     { name = "flash-attn" },
 ]
 oss = [
+    { name = "boto3" },
     { name = "s3fs" },
 ]
 training = [
@@ -2536,6 +2537,7 @@ requires-dist = [
     { name = "albumentations", marker = "extra == 'training'", specifier = ">=1.4.10" },
     { name = "beaker-gantry", marker = "extra == 'beaker'", specifier = ">=3.4.3,<4.0" },
     { name = "beaker-py", marker = "extra == 'beaker'", specifier = ">=2.5.4,<3.0" },
+    { name = "boto3", marker = "extra == 'oss'", specifier = ">=1.40.49,<1.41" },
     { name = "cartopy", marker = "extra == 'training'", specifier = ">=0.25.0" },
     { name = "class-registry", marker = "extra == 'dataset-creation'", specifier = ">=2.1.2" },
     { name = "class-registry", marker = "extra == 'training'", specifier = ">=2.1.2" },

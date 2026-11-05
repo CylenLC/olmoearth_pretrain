@@ -1,10 +1,13 @@
 """OlmoEarth Pretrain DataLoader."""
 
+import copy
 import functools
 import logging
 import math
 import multiprocessing as mp
+import random
 import signal
+import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +104,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
         masking_strategy_b: MaskingStrategy | None = None,
         num_masked_views: int = 1,
         tokenization_config: TokenizationConfig | None = None,
+        reuse_workers_across_epochs: bool = False,
     ):
         """Initialize the OlmoEarthDataLoader.
 
@@ -170,6 +174,10 @@ class OlmoEarthDataLoader(DataLoaderBase):
             masking_strategy_b: Optional second masking strategy for Galileo-style training.
             num_masked_views: Number of masked views to return (1=single, 2=double).
             tokenization_config: Optional tokenization config for custom band groupings.
+            reuse_workers_across_epochs: Opt into persistent workers with explicit
+                epoch reseeding. Preserves sample order, not legacy crop/mask RNG
+                results. Call close() when finished. Dataset contents and collator
+                objects must remain unchanged while workers are retained.
         """
         super().__init__(
             work_dir=work_dir,
@@ -207,6 +215,12 @@ class OlmoEarthDataLoader(DataLoaderBase):
         self.persistent_workers = persistent_workers
         self.multiprocessing_context = multiprocessing_context
         self.num_dataset_repeats_per_epoch = num_dataset_repeats_per_epoch
+        self.reuse_workers_across_epochs = reuse_workers_across_epochs
+        self._torch_loader: torch.utils.data.DataLoader | None = None
+        self._epoch_state: Any = None
+        self._runtime_signature: tuple | None = None
+        self._runtime_generation = 0
+        self._active_iteration: object | None = None
 
         # Dataloader-side masking configuration
         self.transform = transform
@@ -338,6 +352,10 @@ class OlmoEarthDataLoader(DataLoaderBase):
 
     def reshuffle(self, epoch: int | None = None, in_memory: bool = False) -> None:
         """Reshuffle the data."""
+        if self._active_iteration is not None:
+            raise RuntimeError(
+                "Exhaust the current iterator or call close() before reshuffle()"
+            )
         if epoch is None:
             epoch = 1 if self._epoch is None else self._epoch + 1  # type: ignore
         if epoch <= 0:
@@ -357,8 +375,36 @@ class OlmoEarthDataLoader(DataLoaderBase):
             )
         return np.memmap(self._global_indices_file, mode="r", dtype=np.uint32)
 
+    def _can_reuse_workers(self) -> bool:
+        """Use persistent state only for the supported multi-worker file mode."""
+        return (
+            self.reuse_workers_across_epochs
+            and self.persistent_workers
+            and self.num_workers > 0
+            and self._global_indices is None
+        )
+
+    def __iter__(self) -> Iterator[Any]:
+        """Propagate generator close to the managed runtime on the opt-in path."""
+        if not self._can_reuse_workers():
+            yield from super().__iter__()
+            return
+        batches = self._iter_reused_batches()
+        try:
+            for batch in batches:
+                self.batches_processed += 1
+                yield batch
+        finally:
+            batches.close()
+
     def _iter_batches(self) -> Iterable[OlmoEarthSample]:
         """Iterate over the dataset in batches."""
+        if self._can_reuse_workers():
+            return self._iter_reused_batches()
+        # Keep the original construction and RNG path for the default, zero-worker
+        # and in-memory modes. An existing persistent runtime cannot follow them.
+        if self._torch_loader is not None:
+            self.close()
         return torch.utils.data.DataLoader(
             _IterableDatasetWrapper(self),
             batch_size=None,
@@ -374,6 +420,158 @@ class OlmoEarthDataLoader(DataLoaderBase):
             worker_init_fn=_worker_ignore_sigterm if self.num_workers > 0 else None,
             timeout=0,
         )
+
+    def _worker_configuration(self) -> tuple:
+        """Identify settings that require a cold worker restart when changed.
+
+        Dataset/collator internals are immutable during reuse; replace the object
+        or explicitly close() before modifying their contents in place.
+        """
+        return (
+            id(self.dataset),
+            self.dataset.fingerprint,
+            len(self.dataset),
+            str(self.work_dir),
+            self.global_batch_size,
+            self.dp_world_size,
+            self.dp_rank,
+            self.num_workers,
+            self.multiprocessing_context,
+            self.prefetch_factor,
+            self.target_device_type,
+            self.drop_last,
+            self.shuffle,
+            self.num_dataset_repeats_per_epoch,
+            tuple(self.patch_sizes),
+            tuple(self.sampled_hw_p_list),
+            self.token_budget,
+            self.time_priority_prob,
+            self.temporal_bias,
+            self.min_tokens_per_instance,
+            self.max_timesteps,
+            self.tile_size,
+            self.max_location_queries,
+            id(self.collator),
+            id(self.transform),
+            id(self.masking_strategy),
+            id(self.masking_strategy_b),
+            self.num_masked_views,
+            id(self.tokenization_config),
+            self.budget_exclude_modalities,
+        )
+
+    def _iter_reused_batches(self) -> Iterator[Any]:
+        """Publish one immutable epoch snapshot, then use native iterator reset."""
+        if self._active_iteration is not None:
+            raise RuntimeError(
+                "Only one iterator may be active; exhaust it or call close()"
+            )
+        signature = self._worker_configuration()
+        if self._runtime_signature != signature:
+            self.close()
+        if self._torch_loader is None:
+            context = mp.get_context(self.multiprocessing_context)
+            # generation, epoch, seed, consumed batches at this iteration's start.
+            self._epoch_state = context.Array("q", [0, 0, 0, 0])
+            # Never pickle the parent's loader/iterator/queues into spawn workers,
+            # nor form wrapper -> parent -> cached torch loader reference cycles.
+            view = copy.copy(self)
+            view._torch_loader = None
+            view._epoch_state = None
+            view._runtime_signature = None
+            view._active_iteration = None
+            self._torch_loader = torch.utils.data.DataLoader(
+                _IterableDatasetWrapper(view, epoch_state=self._epoch_state),
+                batch_size=None,
+                num_workers=self.num_workers,
+                pin_memory=self.target_device_type == "cuda",
+                prefetch_factor=self.prefetch_factor,
+                persistent_workers=True,
+                multiprocessing_context=self.multiprocessing_context,
+                worker_init_fn=_worker_ignore_sigterm,
+                timeout=0,
+                # Match the factory device used by PyTorch's base-seed tensor.
+                generator=torch.Generator(
+                    device=torch.get_default_device()
+                ).manual_seed(self.seed),
+            )
+            self._runtime_signature = signature
+        with self._epoch_state.get_lock():
+            self._epoch_state[:] = [
+                self._epoch_state[0] + 1,
+                self.epoch,
+                self.seed,
+                self.batches_processed,
+            ]
+        token = object()
+        self._active_iteration = token
+        generation = self._runtime_generation
+        exhausted = False
+        try:
+            iterator = iter(self._torch_loader)
+            while True:
+                if generation != self._runtime_generation:
+                    raise RuntimeError(
+                        "Iterator invalidated by close() or checkpoint restore"
+                    )
+                try:
+                    batch = next(iterator)
+                except StopIteration:
+                    exhausted = True
+                    break
+                yield batch
+        finally:
+            if self._active_iteration is token:
+                self._active_iteration = None
+                if not exhausted:
+                    self.close()
+
+    def close(self) -> None:
+        """Release this loader's persistent runtime, including pending prefetch.
+
+        PyTorch has no public DataLoader.close(). Keep the version-dependent
+        shutdown boundary here; ignored SIGTERM requires a bounded kill fallback.
+        This is for completion, failure or restore, never a normal epoch boundary.
+        """
+        loader = self._torch_loader
+        self._torch_loader = None
+        self._epoch_state = None
+        self._runtime_signature = None
+        self._active_iteration = None
+        self._runtime_generation += 1
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is not None:
+            try:
+                # Stop scheduling and receive only already-dispatched prefetch.
+                # Shutting down while a worker's tensor queue is still sending
+                # can abort its C++ sender thread. Do not drain an entire epoch.
+                iterator._try_put_index = lambda: None
+                original_timeout = iterator._timeout
+                deadline = time.monotonic() + 5
+                try:
+                    while time.monotonic() < deadline:
+                        iterator._timeout = max(0.01, deadline - time.monotonic())
+                        try:
+                            next(iterator)
+                        except StopIteration:
+                            break
+                except Exception:
+                    # The caller may already be handling a failed fetch. Cleanup
+                    # must still shut down workers instead of replaying that error.
+                    logger.debug(
+                        "Discarding failed prefetch during close", exc_info=True
+                    )
+                finally:
+                    iterator._timeout = original_timeout
+            finally:
+                try:
+                    iterator._shutdown_workers()
+                finally:
+                    for worker in iterator._workers:
+                        worker.join(timeout=5)
+                        if worker.is_alive():
+                            worker.kill()
+                            worker.join(timeout=5)
 
     @property
     def worker_info(self):  # type: ignore
@@ -415,16 +613,29 @@ class OlmoEarthDataLoader(DataLoaderBase):
 
     def state_dict(self) -> dict[str, Any]:
         """Get the state dict."""
-        return {
+        state = {
             "dataset_fingerprint_version": self.dataset.fingerprint_version,
             "dataset_fingerprint": self.dataset.fingerprint,
             "batches_processed": self.batches_processed,  # type: ignore
             "seed": self.seed,
             "epoch": self._epoch,
         }
+        if self.reuse_workers_across_epochs:
+            state["worker_rng_policy"] = (
+                "epoch_v1" if self._can_reuse_workers() else "legacy"
+            )
+        return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Load the state dict."""
+        self.close()
+        if self.reuse_workers_across_epochs:
+            self._global_indices = None
+            if state_dict.get("worker_rng_policy") != "epoch_v1":
+                logger.warning(
+                    "Restoring legacy loader state with epoch_v1 worker RNG; sample "
+                    "order is preserved, but crop/mask RNG results may differ."
+                )
         if (
             state_dict["dataset_fingerprint_version"]
             != self.dataset.fingerprint_version
@@ -645,9 +856,20 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
     This is a modified version of olmo_core.data.data_loader._IterableDatasetWrapper
     """
 
-    def __init__(self, data_loader: OlmoEarthDataLoader):
+    def __init__(self, data_loader: OlmoEarthDataLoader, epoch_state: Any = None):
         """Initialize the IterableDatasetWrapper."""
         self.data_loader = data_loader
+        self.epoch_state = epoch_state
+        self._reset_shape_rngs()
+        # Dataloader-side masking configuration
+        self.transform = data_loader.transform
+        self.masking_strategy = data_loader.masking_strategy
+        self.masking_strategy_b = data_loader.masking_strategy_b
+        self.num_masked_views = data_loader.num_masked_views
+
+    def _reset_shape_rngs(self) -> None:
+        """Keep the existing epoch/rank/worker PCG64 shape sampling formula."""
+        data_loader = self.data_loader
         workers = data_loader.num_workers or 1
         self.rngs = [
             get_rng(
@@ -655,11 +877,33 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
             )
             for i in range(workers)
         ]
-        # Dataloader-side masking configuration
-        self.transform = data_loader.transform
-        self.masking_strategy = data_loader.masking_strategy
-        self.masking_strategy_b = data_loader.masking_strategy_b
-        self.num_masked_views = data_loader.num_masked_views
+
+    def _load_epoch_state(self) -> None:
+        """Read once per iterator; reseed only worker-local RNG streams.
+
+        epoch_v1 intentionally differs from native per-spawn base_seed mixing.
+        No worker RNG position/prefetch is checkpointed, so mid-epoch restoration
+        guarantees remaining sample order rather than bitwise augmentation replay.
+        """
+        if self.epoch_state is None:
+            return
+        with self.epoch_state.get_lock():
+            _, epoch, seed, start = self.epoch_state[:]
+        dl = self.data_loader
+        dl._epoch, dl.seed, dl.batches_processed = epoch, seed, start
+        self._reset_shape_rngs()
+        worker_id = self.worker_info.id if self.worker_info is not None else 0
+
+        def stream_seed(tag: int) -> np.ndarray:
+            return np.random.SeedSequence(
+                [seed, epoch, dl.dp_rank, worker_id, tag]
+            ).generate_state(4)
+
+        python_seed = stream_seed(1)
+        random.seed(int(python_seed[0]) | (int(python_seed[1]) << 32))
+        np.random.seed(stream_seed(2))
+        torch_seed = stream_seed(3)
+        torch.manual_seed(int(torch_seed[0]) | (int(torch_seed[1]) << 32))
 
     def _get_batch_item_params_iterator(
         self,
@@ -837,6 +1081,7 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
 
         Transform and masking are applied in the batched collator for better vectorization.
         """
+        self._load_epoch_state()
         global_indices = self.data_loader.get_global_indices()
         indices = self.data_loader._get_local_instance_indices(global_indices)
 
@@ -903,6 +1148,7 @@ class OlmoEarthDataLoaderConfig(Config):
     # Per-sample location-query budget: if set, each rank batch draws a
     # location_query_patch_size (pixels per location query along each side) that fits it.
     max_location_queries: int | None = None
+    reuse_workers_across_epochs: bool = False
 
     def validate(self) -> None:
         """Validate the configuration."""
@@ -990,6 +1236,7 @@ class OlmoEarthDataLoaderConfig(Config):
             masking_strategy_b=masking_strategy_b,
             num_masked_views=self.num_masked_views,
             tokenization_config=self.tokenization_config,
+            reuse_workers_across_epochs=self.reuse_workers_across_epochs,
         )
 
 
