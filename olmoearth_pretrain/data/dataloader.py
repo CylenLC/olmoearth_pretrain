@@ -1,5 +1,6 @@
 """OlmoEarth Pretrain DataLoader."""
 
+import atexit
 import copy
 import functools
 import logging
@@ -7,8 +8,11 @@ import math
 import multiprocessing as mp
 import random
 import signal
+import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -40,6 +44,9 @@ from olmoearth_pretrain.data.dataset import (
     GetItemArgs,
     OlmoEarthDataset,
     OlmoEarthSample,
+    _download_oss_payload,
+    _is_oss_full_get_path,
+    _use_prefetched_oss_payload,
     compute_bandset_rates,
     subset_sample_default,
 )
@@ -105,6 +112,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
         num_masked_views: int = 1,
         tokenization_config: TokenizationConfig | None = None,
         reuse_workers_across_epochs: bool = False,
+        max_inflight_oss_gets_per_worker: int = 2,
     ):
         """Initialize the OlmoEarthDataLoader.
 
@@ -178,6 +186,9 @@ class OlmoEarthDataLoader(DataLoaderBase):
                 epoch reseeding. Preserves sample order, not legacy crop/mask RNG
                 results. Call close() when finished. Dataset contents and collator
                 objects must remain unchanged while workers are retained.
+            max_inflight_oss_gets_per_worker: Maximum number of complete OSS object
+                downloads each worker may have in flight. Values above one overlap
+                object transfer with ordered HDF5 decoding and sample construction.
         """
         super().__init__(
             work_dir=work_dir,
@@ -216,6 +227,11 @@ class OlmoEarthDataLoader(DataLoaderBase):
         self.multiprocessing_context = multiprocessing_context
         self.num_dataset_repeats_per_epoch = num_dataset_repeats_per_epoch
         self.reuse_workers_across_epochs = reuse_workers_across_epochs
+        if not 1 <= max_inflight_oss_gets_per_worker <= 4:
+            raise ValueError(
+                "max_inflight_oss_gets_per_worker must be between 1 and 4"
+            )
+        self.max_inflight_oss_gets_per_worker = max_inflight_oss_gets_per_worker
         self._torch_loader: torch.utils.data.DataLoader | None = None
         self._epoch_state: Any = None
         self._runtime_signature: tuple | None = None
@@ -436,6 +452,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
             self.dp_world_size,
             self.dp_rank,
             self.num_workers,
+            self.max_inflight_oss_gets_per_worker,
             self.multiprocessing_context,
             self.prefetch_factor,
             self.target_device_type,
@@ -850,6 +867,49 @@ def iter_batched(
         yield tuple(batch)
 
 
+class _OSSGetPrefetcher:
+    """Bounded thread pool for complete OSS object downloads in one worker."""
+
+    def __init__(self, concurrency: int):
+        self._clients: list[Any] = []
+        self._clients_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._closed = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=concurrency, thread_name_prefix="olmoearth-oss-get"
+        )
+        # Persistent DataLoader workers reuse this pool across epochs. Close the
+        # thread-owned boto clients when PyTorch eventually shuts a worker down.
+        atexit.register(self.close)
+
+    def _remember_client(self, client: Any) -> None:
+        with self._clients_lock:
+            if client not in self._clients:
+                self._clients.append(client)
+
+    def submit(self, path: UPath) -> Future[bytes]:
+        return self._executor.submit(
+            _download_oss_payload, path, self._remember_client
+        )
+
+    def close(self) -> None:
+        """Wait for active reads, then release each thread's boto client."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            with self._clients_lock:
+                clients, self._clients = self._clients, []
+            for client in clients:
+                try:
+                    client.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close an OSS prefetch client", exc_info=True
+                    )
+            self._closed = True
+
+
 class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample]):
     """Iterable dataset wrapper.
 
@@ -866,6 +926,7 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
         self.masking_strategy = data_loader.masking_strategy
         self.masking_strategy_b = data_loader.masking_strategy_b
         self.num_masked_views = data_loader.num_masked_views
+        self._oss_get_prefetcher: _OSSGetPrefetcher | None = None
 
     def _reset_shape_rngs(self) -> None:
         """Keep the existing epoch/rank/worker PCG64 shape sampling formula."""
@@ -1068,6 +1129,81 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
         """Get worker info."""
         return torch.utils.data.get_worker_info()
 
+    def _supports_oss_get_prefetch(self) -> bool:
+        """Limit concurrent reads to uncached, native OSS OlmoEarth datasets."""
+        dataset = self.dataset
+        if (
+            not isinstance(dataset, OlmoEarthDataset)
+            or dataset.cache_dir is not None
+            or len(dataset) == 0
+        ):
+            return False
+        sample_index = (
+            int(dataset.sample_indices[0])
+            if getattr(dataset, "sample_indices", None) is not None
+            else 0
+        )
+        return _is_oss_full_get_path(dataset._get_h5_file_path(sample_index))
+
+    def _iter_prefetched_dataset_items(
+        self,
+        params: Iterator[tuple[int, int, int, int, int | None]],
+    ) -> Iterator[tuple[tuple[int, OlmoEarthSample], int | None]]:
+        """Download a bounded lookahead while consuming samples in sampler order."""
+        if self._oss_get_prefetcher is None:
+            self._oss_get_prefetcher = _OSSGetPrefetcher(
+                self.data_loader.max_inflight_oss_gets_per_worker
+            )
+        prefetcher = self._oss_get_prefetcher
+        pending: deque[
+            tuple[
+                Future[bytes],
+                UPath,
+                tuple[int, int, int, int, int | None],
+            ]
+        ] = deque()
+
+        def submit_next() -> bool:
+            try:
+                item_params = next(params)
+            except StopIteration:
+                return False
+            idx, _, _, _, _ = item_params
+            dataset = self.dataset
+            sample_index = (
+                int(dataset.sample_indices[idx])
+                if getattr(dataset, "sample_indices", None) is not None
+                else idx
+            )
+            path = dataset._get_h5_file_path(sample_index)
+            pending.append((prefetcher.submit(path), path, item_params))
+            return True
+
+        concurrency = self.data_loader.max_inflight_oss_gets_per_worker
+        try:
+            for _ in range(concurrency):
+                if not submit_next():
+                    break
+            while pending:
+                future, path, item_params = pending.popleft()
+                payload = future.result()
+                # Refill the freed slot before HDF5 decoding and sample building.
+                submit_next()
+                idx, patch_size, sampled_hw_p, target_t, location_patch_size = (
+                    item_params
+                )
+                with _use_prefetched_oss_payload(path, payload):
+                    item = self.data_loader._get_dataset_item(
+                        int(idx), patch_size, sampled_hw_p, target_t
+                    )
+                del payload
+                yield item, location_patch_size
+        finally:
+            # On early iterator shutdown, queued requests are cancelled where
+            # possible. Running reads finish before the worker's executor closes.
+            for future, _, _ in pending:
+                future.cancel()
+
     def __iter__(self) -> Iterator[Any]:
         """Iterate over the dataset.
 
@@ -1087,22 +1223,33 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
 
         # Create iterator that fetches samples from the dataset, each carrying the
         # location-query patch size of its rank batch.
-        instance_iterator = (
-            (
-                self.data_loader._get_dataset_item(
-                    int(idx), patch_size, sampled_hw_p, target_t
-                ),
-                location_query_patch_size,
-            )
-            for idx, patch_size, sampled_hw_p, target_t, location_query_patch_size in (
-                self._get_batch_item_params_iterator(
-                    indices,
-                    self.data_loader.patch_sizes,
-                    self.data_loader.sampled_hw_p_list,
-                    self.data_loader.rank_batch_size,
-                )
-            )
+        item_params = self._get_batch_item_params_iterator(
+            indices,
+            self.data_loader.patch_sizes,
+            self.data_loader.sampled_hw_p_list,
+            self.data_loader.rank_batch_size,
         )
+        if (
+            self.data_loader.max_inflight_oss_gets_per_worker > 1
+            and self._supports_oss_get_prefetch()
+        ):
+            instance_iterator = self._iter_prefetched_dataset_items(item_params)
+        else:
+            instance_iterator = (
+                (
+                    self.data_loader._get_dataset_item(
+                        int(idx), patch_size, sampled_hw_p, target_t
+                    ),
+                    location_query_patch_size,
+                )
+                for (
+                    idx,
+                    patch_size,
+                    sampled_hw_p,
+                    target_t,
+                    location_query_patch_size,
+                ) in item_params
+            )
 
         return (
             (
@@ -1149,6 +1296,7 @@ class OlmoEarthDataLoaderConfig(Config):
     # location_query_patch_size (pixels per location query along each side) that fits it.
     max_location_queries: int | None = None
     reuse_workers_across_epochs: bool = False
+    max_inflight_oss_gets_per_worker: int = 2
 
     def validate(self) -> None:
         """Validate the configuration."""
@@ -1161,6 +1309,10 @@ class OlmoEarthDataLoaderConfig(Config):
         if self.num_masked_views not in (1, 2):
             raise ValueError(
                 f"num_masked_views must be 1 or 2, got {self.num_masked_views}"
+            )
+        if not 1 <= self.max_inflight_oss_gets_per_worker <= 4:
+            raise ValueError(
+                "max_inflight_oss_gets_per_worker must be between 1 and 4"
             )
 
     @property
@@ -1237,6 +1389,7 @@ class OlmoEarthDataLoaderConfig(Config):
             num_masked_views=self.num_masked_views,
             tokenization_config=self.tokenization_config,
             reuse_workers_across_epochs=self.reuse_workers_across_epochs,
+            max_inflight_oss_gets_per_worker=self.max_inflight_oss_gets_per_worker,
         )
 
 

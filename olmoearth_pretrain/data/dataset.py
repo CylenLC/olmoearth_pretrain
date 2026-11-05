@@ -11,7 +11,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 from urllib.parse import urlsplit
 
 import h5py
@@ -48,24 +48,23 @@ logger = logging.getLogger(__name__)
 _oss_clients = threading.local()
 
 
-@contextmanager
-def _open_h5_file(path: UPath):
-    """Read Alibaba OSS objects completely, retaining normal UPath behavior elsewhere."""
+def _is_oss_full_get_path(path: UPath) -> bool:
+    """Return whether a path uses the supported Alibaba OSS S3 endpoint."""
     options = path.storage_options
-    client_options = dict(options.get("client_kwargs", {}))
-    endpoint = client_options.get("endpoint_url") or ""
+    endpoint = dict(options.get("client_kwargs", {})).get("endpoint_url") or ""
     host = urlsplit(endpoint).hostname or ""
-    if path.protocol != "s3" or not host.endswith(".aliyuncs.com"):
-        with path.open("rb") as stream:
-            yield stream
-        return
+    return path.protocol == "s3" and host.endswith(".aliyuncs.com")
 
-    # Clients are created lazily in the worker that uses them, never pickled.
+
+def _get_oss_client(path: UPath, on_create: Callable[[Any], None] | None = None):
+    """Get a boto3 client cached to the current process and thread."""
     import boto3
     from botocore.config import Config as BotoConfig
 
-    profile = options.get("profile")
+    options = path.storage_options
+    client_options = dict(options.get("client_kwargs", {}))
     config_options = dict(options.get("config_kwargs", {}))
+    profile = options.get("profile")
     signature = (os.getpid(), profile, client_options, config_options)
     if getattr(_oss_clients, "signature", None) != signature:
         old_client = getattr(_oss_clients, "client", None)
@@ -76,8 +75,20 @@ def _open_h5_file(path: UPath):
             "s3", config=BotoConfig(**config_options), **client_options
         )
         _oss_clients.signature = signature
+        if on_create is not None:
+            on_create(_oss_clients.client)
+    return _oss_clients.client
+
+
+def _download_oss_payload(
+    path: UPath, on_client_create: Callable[[Any], None] | None = None
+) -> bytes:
+    """Download one complete OSS object without persisting it locally."""
+    if not _is_oss_full_get_path(path):
+        raise ValueError(f"Not a supported OSS full-GET path: {path.protocol}")
+    client = _get_oss_client(path, on_client_create)
     object_url = urlsplit(str(path))
-    response = _oss_clients.client.get_object(
+    response = client.get_object(
         Bucket=object_url.netloc, Key=object_url.path.lstrip("/")
     )
     body = response["Body"]
@@ -87,6 +98,41 @@ def _open_h5_file(path: UPath):
         body.close()
     if len(payload) != response["ContentLength"]:
         raise OSError("OSS response body length does not match ContentLength")
+    return payload
+
+
+@contextmanager
+def _use_prefetched_oss_payload(path: UPath, payload: bytes):
+    """Supply one downloaded object to the normal Dataset parsing path."""
+    previous = getattr(_oss_clients, "prefetched_payload", None)
+    _oss_clients.prefetched_payload = (str(path), payload)
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                del _oss_clients.prefetched_payload
+            except AttributeError:
+                pass
+        else:
+            _oss_clients.prefetched_payload = previous
+
+
+@contextmanager
+def _open_h5_file(path: UPath):
+    """Read OSS objects fully while retaining normal UPath behavior elsewhere."""
+    prefetched = getattr(_oss_clients, "prefetched_payload", None)
+    if prefetched is not None and prefetched[0] == str(path):
+        with io.BytesIO(prefetched[1]) as stream:
+            yield stream
+        return
+
+    if not _is_oss_full_get_path(path):
+        with path.open("rb") as stream:
+            yield stream
+        return
+
+    payload = _download_oss_payload(path)
     with io.BytesIO(payload) as stream:
         yield stream
 

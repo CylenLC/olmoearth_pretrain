@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import h5py
@@ -23,6 +24,7 @@ from upath import UPath
 
 from olmoearth_pretrain.data.collate import collate_double_masked_batched
 from olmoearth_pretrain.data.constants import Modality
+from olmoearth_pretrain.data import dataloader as dataloader_module
 from olmoearth_pretrain.data.dataloader import (
     OlmoEarthDataLoader,
     OlmoEarthDataLoaderConfig,
@@ -76,6 +78,19 @@ def recording_collator(batch, *, masking_strategy, fail=False):
     )
 
 
+class _FakeOSSClient:
+    """No-network client placeholder for worker-side prefetch cleanup tests."""
+
+    def close(self):
+        pass
+
+
+def _read_local_h5_as_oss(path, on_client_create):
+    """Emulate a complete GET while retaining the production prefetch flow."""
+    on_client_create(_FakeOSSClient())
+    return Path(str(path)).read_bytes()
+
+
 def scalar_recording_collator(batch):
     """Keep generator startup tests independent of tensor IPC reconstruction."""
     info = torch.utils.data.get_worker_info()
@@ -124,7 +139,17 @@ class DataLoaderLifecycleTests(unittest.TestCase):
         dataset.latlon_distribution = np.zeros((27, 2))
         return dataset
 
-    def loader(self, *, reuse=True, workers=2, rank=0, world=1, fail=False):
+    def loader(
+        self,
+        *,
+        reuse=True,
+        workers=2,
+        rank=0,
+        world=1,
+        fail=False,
+        inflight=1,
+        context="spawn",
+    ):
         """Build real spawn workers; None tests the unconfigured default path."""
         masking = MaskingConfig(
             strategy_config={
@@ -149,12 +174,14 @@ class DataLoaderLifecycleTests(unittest.TestCase):
             num_workers=workers,
             prefetch_factor=2,
             target_device_type="cpu",
+            multiprocessing_context=context,
             dp_world_size=world,
             dp_rank=rank,
             collator=functools.partial(
                 recording_collator, masking_strategy=masking, fail=fail
             ),
             masking_strategy=masking,
+            max_inflight_oss_gets_per_worker=inflight,
             **({} if reuse is None else {"reuse_workers_across_epochs": reuse}),
         )
         self.addCleanup(lambda: getattr(loader, "close", lambda: None)())
@@ -204,6 +231,30 @@ class DataLoaderLifecycleTests(unittest.TestCase):
             loader.reset()
         self.assertEqual(len(epochs[0]), 2)
         self.assertEqual(epochs[0], epochs[1])
+
+    def test_bounded_oss_prefetch_preserves_order_and_rng(self):
+        """Threaded GET lookahead keeps the same CPU tensors and epoch RNG."""
+        outputs = {}
+        with (
+            patch.object(dataloader_module, "_is_oss_full_get_path", return_value=True),
+            patch.object(
+                dataloader_module, "_download_oss_payload", _read_local_h5_as_oss
+            ),
+        ):
+            for inflight in (1, 2):
+                loader = self.loader(workers=2, inflight=inflight, context="fork")
+                epochs = []
+                for epoch in (1, 2):
+                    loader.reshuffle(epoch)
+                    batches = list(loader)
+                    self.assert_order(loader, batches)
+                    epochs.append([self.digest(batch) for batch in batches])
+                    loader.reset()
+                workers = self.workers(loader)
+                loader.close()
+                self.assert_closed(workers)
+                outputs[inflight] = epochs
+        self.assertEqual(outputs[1], outputs[2])
 
     def test_default_keeps_legacy_path(self):
         """An omitted flag retains construction, sample order and checkpoint keys."""

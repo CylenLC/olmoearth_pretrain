@@ -1,6 +1,7 @@
 """Regression coverage for complete OSS HDF5 reads."""
 
 import io
+import threading
 
 import boto3
 import h5py
@@ -9,6 +10,7 @@ import pytest
 from upath import UPath
 
 from olmoearth_pretrain.data import dataset as dataset_module
+from olmoearth_pretrain.data import dataloader as dataloader_module
 from olmoearth_pretrain.data.dataset import OlmoEarthDataset, OSSConfig
 from olmoearth_pretrain.dataset.convert_to_h5py import ConvertToH5py
 
@@ -108,3 +110,85 @@ def test_oss_full_get_closes_short_response(monkeypatch):
     ):
         pass
     assert body.closed
+
+
+def test_prefetched_oss_payload_uses_normal_hdf5_reader(monkeypatch, tmp_path):
+    """Prefetched bytes enter the same Dataset parser without a second GET."""
+    local = tmp_path / "sample.h5"
+    with h5py.File(local, "w") as file:
+        file["timestamps"] = np.arange(6).reshape(3, 2)
+        file["sentinel1"] = np.arange(24).reshape(2, 3, 4)
+    payload = local.read_bytes()
+    path = UPath(
+        "s3://bucket/sample.h5",
+        **OSSConfig(
+            endpoint_url="https://oss-cn-beijing-internal.aliyuncs.com",
+            region="cn-beijing",
+        ).storage_options(),
+    )
+
+    def unexpected_session(*args, **kwargs):
+        raise AssertionError("prefetched bytes should avoid a second OSS GET")
+
+    monkeypatch.setattr(boto3, "Session", unexpected_session)
+    dataset = object.__new__(OlmoEarthDataset)
+    dataset.cache_dir = None
+    dataset.sec_per_sample = None
+    dataset.training_modalities = ["sentinel1"]
+    dataset.dtype = np.float32
+
+    with dataset_module._use_prefetched_oss_payload(path, payload):
+        sample, masks = dataset.read_h5_file(path)
+    np.testing.assert_array_equal(sample["timestamps"], np.arange(6).reshape(3, 2))
+    np.testing.assert_array_equal(sample["sentinel1"], np.arange(24).reshape(2, 3, 4))
+    assert masks == {}
+
+
+def test_oss_get_prefetcher_bounds_parallelism_and_closes_clients(monkeypatch):
+    """Per-worker full GET futures respect their configured bound."""
+    active = 0
+    peak = 0
+    submitted = 0
+    lock = threading.Lock()
+    both_started = threading.Barrier(2, timeout=5)
+    clients = []
+
+    class Client:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    def fake_download(path, on_client_create):
+        nonlocal active, peak, submitted
+        client = Client()
+        on_client_create(client)
+        with lock:
+            submitted += 1
+            sequence = submitted
+            active += 1
+            peak = max(peak, active)
+        try:
+            if sequence <= 2:
+                both_started.wait()
+            return path.name.encode()
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(dataloader_module, "_download_oss_payload", fake_download)
+    options = OSSConfig(
+        endpoint_url="https://oss-cn-beijing-internal.aliyuncs.com", region="cn-beijing"
+    ).storage_options()
+    paths = [UPath(f"s3://bucket/{idx}", **options) for idx in range(3)]
+    prefetcher = dataloader_module._OSSGetPrefetcher(2)
+    try:
+        futures = [prefetcher.submit(path) for path in paths]
+        assert [future.result(timeout=5) for future in futures] == [b"0", b"1", b"2"]
+        peak = max(peak, active)
+        clients = list(prefetcher._clients)
+    finally:
+        prefetcher.close()
+
+    assert peak == 2
+    assert clients and all(client.closed for client in clients)
