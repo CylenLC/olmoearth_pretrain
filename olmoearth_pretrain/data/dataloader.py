@@ -29,7 +29,7 @@ from olmo_core.distributed.utils import (
     get_world_size,
 )
 from olmo_core.utils import get_default_device
-from torch.utils.data import default_collate
+from torch.utils.data import default_collate, default_convert
 from upath import UPath
 
 from olmoearth_pretrain._compat import deprecated_class_alias as _deprecated_class_alias
@@ -51,10 +51,57 @@ from olmoearth_pretrain.data.dataset import (
     subset_sample_default,
 )
 from olmoearth_pretrain.data.transform import Transform, TransformConfig
+from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample
 from olmoearth_pretrain.nn.tokenization import TokenizationConfig
 from olmoearth_pretrain.train.masking import MaskingConfig, MaskingStrategy
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _MaskedViewBatch:
+    """Let PyTorch pin shared view inputs once before handing back the batch."""
+
+    batch: list[Any]
+
+    def pin_memory(self) -> list[Any]:
+        """Pin the independent masks and reuse pinned copies of shared inputs."""
+        patch_size, view_a, view_b, location_patch_size = self.batch
+        shared_fields = view_a.shared_input_fields(view_b)
+        pinned_a = {
+            name: value.pin_memory() if isinstance(value, torch.Tensor) else value
+            for name, value in view_a.as_dict().items()
+        }
+        pinned_b = {}
+        for name, value in view_b.as_dict().items():
+            if name in shared_fields:
+                value = pinned_a[name]
+            elif isinstance(value, torch.Tensor):
+                value = value.pin_memory()
+            pinned_b[name] = value
+        return [
+            patch_size,
+            MaskedOlmoEarthSample(**pinned_a),
+            MaskedOlmoEarthSample(**pinned_b),
+            location_patch_size,
+        ]
+
+
+def _convert_for_pin_memory(batch: Any) -> Any:
+    batch = default_convert(batch)
+    if (
+        isinstance(batch, list)
+        and len(batch) == 4
+        and isinstance(batch[1], MaskedOlmoEarthSample)
+        and isinstance(batch[2], MaskedOlmoEarthSample)
+    ):
+        return _MaskedViewBatch(batch)
+    return batch
+
+
+def _unwrap_masked_view_batch(batch: Any) -> Any:
+    # PyTorch may skip pinning when an accelerator is unavailable.
+    return batch.batch if isinstance(batch, _MaskedViewBatch) else batch
 
 
 def _worker_ignore_sigterm(worker_id: int) -> None:
@@ -421,11 +468,13 @@ class OlmoEarthDataLoader(DataLoaderBase):
         # and in-memory modes. An existing persistent runtime cannot follow them.
         if self._torch_loader is not None:
             self.close()
-        return torch.utils.data.DataLoader(
+        pin_memory = self.target_device_type == "cuda" and self.num_workers > 0
+        loader = torch.utils.data.DataLoader(
             _IterableDatasetWrapper(self),
             batch_size=None,
             num_workers=self.num_workers,
-            pin_memory=self.target_device_type == "cuda" and self.num_workers > 0,
+            pin_memory=pin_memory,
+            collate_fn=_convert_for_pin_memory if pin_memory else None,
             prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
             persistent_workers=(
                 self.persistent_workers if self.num_workers > 0 else False
@@ -436,6 +485,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
             worker_init_fn=_worker_ignore_sigterm if self.num_workers > 0 else None,
             timeout=0,
         )
+        return map(_unwrap_masked_view_batch, loader) if pin_memory else loader
 
     def _worker_configuration(self) -> tuple:
         """Identify settings that require a cold worker restart when changed.
@@ -502,6 +552,11 @@ class OlmoEarthDataLoader(DataLoaderBase):
                 batch_size=None,
                 num_workers=self.num_workers,
                 pin_memory=self.target_device_type == "cuda",
+                collate_fn=(
+                    _convert_for_pin_memory
+                    if self.target_device_type == "cuda"
+                    else None
+                ),
                 prefetch_factor=self.prefetch_factor,
                 persistent_workers=True,
                 multiprocessing_context=self.multiprocessing_context,
@@ -536,7 +591,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
                 except StopIteration:
                     exhausted = True
                     break
-                yield batch
+                yield _unwrap_masked_view_batch(batch)
         finally:
             if self._active_iteration is token:
                 self._active_iteration = None

@@ -1,6 +1,7 @@
 """Integration tests for the contrastive latent MIM Training Module."""
 
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -217,6 +218,93 @@ def test_train_batch_with_missing_modalities(
         logger.info(mock_trainer._metrics)
         check_loss_is_a_reasonable_value(mock_trainer._metrics["train/PatchDisc"])
         check_loss_is_a_reasonable_value(mock_trainer._metrics["train/InfoNCE"])
+
+
+def test_shared_input_transfer_preserves_loss_and_gradients(
+    samples_without_missing_modalities: list[tuple[int, OlmoEarthSample]],
+    latent_mim_model: LatentMIM,
+    train_module_config: ContrastiveLatentMIMTrainModuleConfig,
+    set_random_seeds: None,
+) -> None:
+    """Count transfers while comparing training against separate input copies."""
+    from copy import deepcopy
+
+    masking = MaskingConfig(strategy_config={"type": "random"}).build()
+    distinct_samples = []
+    for index, (patch_size, sample) in enumerate(samples_without_missing_modalities):
+        timestamps = sample.timestamps.copy()
+        timestamps[..., 2] += index
+        distinct_samples.append(
+            (
+                patch_size,
+                sample._replace(
+                    sentinel2_l2a=sample.sentinel2_l2a + index, timestamps=timestamps
+                ),
+            )
+        )
+    patch_size, view_a, view_b = collate_double_masked_batched(
+        distinct_samples,
+        transform=None,
+        masking_strategy=masking,
+        masking_strategy_b=None,
+    )
+    # Exercise two microbatches, including a final partial microbatch.
+    microbatch_size = view_a.batch_size - 1
+    train_module_config.rank_microbatch_size = microbatch_size
+    input_fields = ("timestamps", *view_a.modalities)
+    separate_b = view_b._replace(
+        **{name: getattr(view_b, name).clone() for name in input_fields}
+    )
+    original_to = torch.Tensor.to
+
+    def transfer_key(field, tensor):
+        return (
+            field,
+            tensor.untyped_storage().data_ptr(),
+            tensor.storage_offset(),
+            tuple(tensor.shape),
+        )
+
+    def expected_transfers(*views):
+        return Counter(
+            transfer_key(field, getattr(view, field)[start : start + microbatch_size])
+            for view in views
+            for field in input_fields
+            for start in range(0, view.batch_size, microbatch_size)
+        )
+
+    def run(second_view):
+        model = deepcopy(latent_mim_model)
+        module = deepcopy(train_module_config).build(model, device="cpu")
+        trainer = MockTrainer()
+        module.on_attach = MagicMock()  # type: ignore
+        module._attach_trainer(trainer)
+        fields_by_ptr = {
+            getattr(view, name).untyped_storage().data_ptr(): name
+            for view in (view_a, second_view)
+            for name in input_fields
+        }
+        transfers = Counter()
+
+        def copy_on_transfer(tensor, *args, **kwargs):
+            if kwargs.get("non_blocking"):
+                field = fields_by_ptr.get(tensor.untyped_storage().data_ptr())
+                if field is not None:
+                    transfers[transfer_key(field, tensor)] += 1
+                    return tensor.clone()
+            return original_to(tensor, *args, **kwargs)
+
+        torch.manual_seed(42)
+        with patch.object(torch.Tensor, "to", copy_on_transfer):
+            module.train_batch((patch_size, view_a, second_view))
+        return trainer._metrics, [p.grad for p in model.parameters()], transfers
+
+    ref_metrics, ref_grads, ref_transfers = run(separate_b)
+    metrics, grads, transfers = run(view_b)
+    assert transfers == expected_transfers(view_a)
+    assert ref_transfers == expected_transfers(view_a, separate_b)
+    torch.testing.assert_close(metrics, ref_metrics, rtol=0, atol=0)
+    torch.testing.assert_close(grads, ref_grads, rtol=0, atol=0)
 
 
 def _run_train_batch_and_get_loss(

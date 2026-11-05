@@ -214,6 +214,7 @@ class ContrastiveLatentMIMTrainModule(OlmoEarthTrainModule):
         patch_size = batch[0]
         batch_data_a = batch[1]
         batch_data_b = batch[2]
+        shared_inputs = batch_data_a.shared_input_fields(batch_data_b)
         microbatches_a = split_masked_batch(batch_data_a, self.rank_microbatch_size)
         microbatches_b = split_masked_batch(batch_data_b, self.rank_microbatch_size)
         num_microbatches = len(microbatches_a)
@@ -227,7 +228,12 @@ class ContrastiveLatentMIMTrainModule(OlmoEarthTrainModule):
                     f"with batch size {microbatch_a.batch_size}"
                 )
                 masked_batch_a = microbatch_a.to_device(self.device)
-                masked_batch_b = microbatch_b.to_device(self.device)
+                masked_batch_b = microbatch_b.to_device(
+                    self.device,
+                    transferred_inputs={
+                        name: getattr(masked_batch_a, name) for name in shared_inputs
+                    },
+                )
 
                 # Run Encoder and decoder on the augmented input
                 loss_a, latent_a, decoded_a, target_output_a, pooled_a = (

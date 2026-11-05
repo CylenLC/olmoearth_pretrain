@@ -423,13 +423,40 @@ class MaskedOlmoEarthSample(NamedTuple):
         """Get the batch size of the sample."""
         return self.timestamps.shape[0]
 
+    def shared_input_fields(self, other: MaskedOlmoEarthSample) -> tuple[str, ...]:
+        """Return the input fields that reference the same tensor in both views."""
+        return tuple(
+            name
+            for name, value in self.as_dict().items()
+            if name not in _MASKED_SAMPLE_MASK_FIELDS
+            and isinstance(value, Tensor)
+            and value is getattr(other, name)
+        )
+
     def to_device(
-        self, device: torch.device, non_blocking: bool = True
+        self,
+        device: torch.device,
+        non_blocking: bool = True,
+        *,
+        transferred_inputs: dict[str, Tensor] | None = None,
     ) -> MaskedOlmoEarthSample:
-        """Move all tensors to the specified device."""
+        """Move tensors to the device, reusing any already transferred inputs.
+
+        Args:
+            device: Destination device.
+            non_blocking: Whether to request non-blocking transfers.
+            transferred_inputs: Input fields already on ``device`` for the same
+                microbatch slice. Reused tensors are shared across views and must
+                be treated as read-only by their consumers.
+        """
+        transferred_inputs = transferred_inputs or {}
         return MaskedOlmoEarthSample(
             **{
-                key: val.to(device, non_blocking=non_blocking)
+                key: (
+                    transferred_inputs[key]
+                    if key in transferred_inputs
+                    else val.to(device, non_blocking=non_blocking)
+                )
                 for key, val in self.as_dict(include_nones=False).items()
                 if val is not None and hasattr(val, "to")
             }

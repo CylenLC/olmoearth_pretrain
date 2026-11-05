@@ -327,6 +327,105 @@ class DataLoaderLifecycleTests(unittest.TestCase):
             loader.close()
         self.assertEqual(runs[0], runs[1])
 
+    def _double_masked_loader(self, *, target_device_type, **kwargs):
+        loader = self.loader(**kwargs)
+        loader.target_device_type = target_device_type
+        loader.collator = functools.partial(
+            collate_double_masked_batched,
+            transform=FlipAndRotateSpace(),
+            masking_strategy=loader.masking_strategy,
+            masking_strategy_b=None,
+        )
+        return loader
+
+    def test_cuda_target_without_accelerator_preserves_batch_interface(self):
+        """Both loader modes unwrap the batch when PyTorch skips CUDA pinning."""
+        for reuse in (True, False):
+            with (
+                self.subTest(reuse=reuse),
+                torch.random.fork_rng(devices=[]),
+                patch.object(torch.accelerator, "is_available", return_value=False),
+            ):
+                baseline = self._double_masked_loader(
+                    target_device_type="cpu", reuse=reuse, workers=1
+                )
+                fallback = self._double_masked_loader(
+                    target_device_type="cuda", reuse=reuse, workers=1
+                )
+                baseline.reshuffle(1)
+                fallback.reshuffle(1)
+                torch.manual_seed(42)
+                expected_batches = list(baseline)
+                torch.manual_seed(42)
+                with self.assertWarnsRegex(UserWarning, "no accelerator"):
+                    actual_batches = list(fallback)
+
+                self.assertEqual(len(actual_batches), baseline.total_batches)
+                for actual, expected in zip(
+                    actual_batches, expected_batches, strict=True
+                ):
+                    self.assertIs(type(actual), list)
+                    self.assertEqual(len(actual), 4)
+                    for index in (1, 2):
+                        self.assertIs(type(actual[index]), type(expected[index]))
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                baseline.close()
+                fallback.close()
+
+    def test_pin_shared_inputs_preserves_epoch_rng_and_batch_interface(self):
+        """Run the real loader and pin thread with CPU copies in place of CUDA pinning."""
+        baseline = self._double_masked_loader(target_device_type="cpu")
+        pinned = self._double_masked_loader(target_device_type="cuda")
+
+        pinned_inputs = []
+
+        def copy_for_pin(tensor):
+            pinned_inputs.append(tensor)
+            return tensor.clone()
+
+        with (
+            patch.object(torch.accelerator, "is_available", return_value=True),
+            patch.object(
+                torch.accelerator,
+                "current_accelerator",
+                return_value=torch.device("cuda"),
+            ),
+            patch.object(torch.accelerator, "current_device_index", return_value=0),
+            patch.object(torch.accelerator, "set_device_index"),
+            patch.object(torch.Tensor, "pin_memory", copy_for_pin),
+        ):
+            for epoch in (1, 2):
+                baseline.reshuffle(epoch)
+                pinned.reshuffle(epoch)
+                expected_batches = list(baseline)
+                pinned_inputs.clear()
+                actual_batches = list(pinned)
+                self.assertEqual(len(actual_batches), len(expected_batches))
+                expected_pin_calls = 0
+                for expected, actual in zip(
+                    expected_batches, actual_batches, strict=True
+                ):
+                    self.assertIs(type(actual), type(expected))
+                    self.assertEqual((actual[0], actual[3]), (expected[0], expected[3]))
+                    view_a, view_b = actual[1:3]
+                    for ref, view in zip(expected[1:3], actual[1:3], strict=True):
+                        for field, value in ref.as_dict().items():
+                            torch.testing.assert_close(
+                                getattr(view, field), value, rtol=0, atol=0
+                            )
+                    for field in ("timestamps", *view_a.modalities):
+                        self.assertIs(getattr(view_a, field), getattr(view_b, field))
+                    for modality in view_a.modalities:
+                        field = view_a.get_masked_modality_name(modality)
+                        self.assertIsNot(getattr(view_a, field), getattr(view_b, field))
+                    expected_pin_calls += 1 + 3 * len(view_a.modalities)
+                self.assertEqual(len(pinned_inputs), expected_pin_calls)
+                self.assertEqual(
+                    len({id(tensor) for tensor in pinned_inputs}), expected_pin_calls
+                )
+                baseline.reset()
+                pinned.reset()
+
     def test_shapes_match_legacy_epoch_formula(self):
         """Reuse does not change full-epoch PCG64-driven batch geometry."""
         shapes = []
