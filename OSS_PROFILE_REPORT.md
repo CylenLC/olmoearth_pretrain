@@ -173,7 +173,34 @@ CUDA kernel 活动总量基本不变，三个采样 step 的 kernel gap 合计�
 
 **判断：短窗结果显示 CPU 核心布局可能显著影响 GPU 供给，但尚不足以断定 worker CPU 竞争是主要瓶颈。** affinity A/B 的方向一致（吞吐 +19.5%、kernel gap −12.8%、GPU 利用率 +12.8 个百分点），但只完成一对、默认调度总是先跑；窗口只有 12 个不同形状的更新，而且 `next()` 尾延迟在两组落于不同 step，无法估计运行间误差。主线程 runqueue 等待极少，worker CPU 总量也未明显下降，所以证据不支持“CPU 被用满导致主线程排队”这个解释；可能的核共享、缓存或 worker 供给效应仍需复测确认。**没有把 CPU affinity 接入生产 DataLoader，也没有更改模型、GET、并发、worker 数或 prefetch。**下一步最有价值的是反序再做一对相同短窗 A/B，并记录 worker 主线程及 GET 线程的 schedstat，以判断正向差异能否复现。
 
-## 8. 优先级
+## 8. 按 task ID 关联有序交付
+
+在 benchmark observer 中，将 PyTorch 的派发 task ID 贯穿 worker 取任务、GET/Future、HDF5、collate、结果入队、pin 线程取件、pin 完成和主线程交付。GET 在提交时记录 `(worker, request_id)`，Future 消费时使用相同 ID，因此跨 batch 的预取也能关联。worker `Queue.put()` 返回只代表放入本进程发送缓冲，后续到 pin 线程收到之间包含序列化、传输及 pin 线程处理其他 batch 的等待，不应单独称为纯 IPC。主线程交付 ID 的计算针对本配方的 `in_order=True`。
+
+CPU 上的真实 DataLoader 小样本验证了派发至交付的 task ID、线程池 GET/Future 的 request ID，以及 pin 队列前后 task ID；样本输出与未启用 observer 的输出一致。真实 OSS W8C2、prefetch 4、batch 512、microbatch 64 的 24-step 诊断中，24 个交付 task 的这些阶段均有记录，每个已消费 Future 都能找到对应 GET。报告的数据按单调时钟关联；详细结果保留在本地未提交的 `benchmarks/oss_profile/evidence/ordered-task-summary.json`。
+
+**这次没有复现 worker 0 的稳态长尾。** worker 0 的 step 9 和 17 的 `next()` 分别为 0.31 和 0.44 ms，其 batch 分别提前约 7.09 和 10.73 秒完成 worker 侧处理。启动期 step 1 等待 23.97 s，其 worker fetch 为 23.85 s，其中 Future 等待累计 12.62 s、HDF5 读取使用 7.85 thread-CPU 秒；并发墙钟和 CPU 时间不能直接相加。历史 200-step 的 8 次长等没有 task ID，不能从这次追踪反推它们的具体阶段。
+
+本次抓到另一个可定位的尾巴：step 10 / task 9（worker 1）`next()` 等待 **996.6 ms**，目标 batch 在开始等待前 **1291.5 ms** 已经完成 worker fetch。目标结果入队后 **2129.7 ms** 才被 pin 线程取到；期间 pin 线程先处理后续 task 15，其 pin 操作持续 1169.1 ms，与 step 10 的等待重叠 **422.7 ms**。目标 task 9 在等待开始后 838.5 ms 被 pin 线程接收，自己的 pin 操作耗时 132.1 ms，在等待开始后 996.2 ms 输出。这一实例表明后续 batch 的 pin 工作可延迟当前按序消费的 batch，但它属于 worker 1，并不足以证明历史 worker 0 的 8 次长等由同一机制造成。
+
+GPU 启动前检查为 0 MiB、无 compute PID；运行后有其他实验的 compute PID 出现，在 164 个 GPU 样本中占 113 个。因此以下数值只描述受干扰的诊断运行，**不能用于性能 A/B 或优化收益判断**：steps 9–24 为 171.3 samples/s，`next()` 均值 / p50 / 最大为 89.36 / 0.322 / 996.6 ms，worker CPU user / system 为 6.75 / 2.32 核，GPU 利用率 1 Hz 均值为 40.7%（包含外部进程）。24 步完成后有 9 个 GET 在途，16970 个 GET 开始和结束数相等、无错误；8 个 worker exit 0、无残留和 abort。
+
+在用户确认 GPU 空闲后，又连续完成两次相同配置、相同 observer 的 24-step 短跑。两轮启动前 GPU 均空闲，全部 1 Hz GPU 采样没有外部 compute PID；steps 9–24 的每个 task 都是同样 512 个样本索引，顺序与输入形状逐步一致，索引 SHA-256 均为 `985e3a6b8ff0b1e4178e25549bfc292453e604c5d3d1f2206c069fbef57b8b10`。这些都是优化前诊断，并非前后对照。
+
+| 指标，steps 9–24 | 干净短跑 1 | 干净短跑 2 |
+|---|---:|---:|
+| 吞吐 | 193.4 samples/s | 183.2 samples/s |
+| `next()` mean / p50 / max | 0.374 / 0.347 / 0.665 ms | 0.405 / 0.325 / 1.098 ms |
+| worker 0 的 step 9 / 17 `next()` | 0.373 / 0.241 ms | 1.098 / 0.470 ms |
+| worker CPU user / system | 7.29 / 2.79 核 | 7.61 / 2.89 核 |
+| GPU 利用率，1 Hz 均值 | 53.25% | 43.50% |
+| 关闭时在途 GET / 8 个 worker 退出码 | 14 / 全为 0 | 11 / 全为 0 |
+
+两轮 24 个 task 的阶段关联完整，所有 Future 均找到对应 GET；关闭时各自所有 GET 都结束、无错误、无 worker 残留或 abort。启动期 step 2 分别等待 11.21 / 13.71 秒；batch 完成 worker fetch 后仍有 3.86 / 4.52 秒，pin 线程在等待窗口内也处理了若干后续 task。这再次验证启动期 pin 工作和队列延迟，但稳态 worker 0 的秒级等待仍未复现。两次相同输入的吞吐相差约 5.3%，不能将单次短窗差异当作优化收益。
+
+本轮没有把性能优化接入默认 DataLoader：目标 worker 0 的稳态尾巴在两次干净短窗中均未复现，无法验证 pin 优先级调整是否解决历史问题，也没有可信的优化后吞吐。下一步应继续收集有 task ID 的短窗直到复现目标尾巴；若目标 batch 确认被后续 pin 阻塞，再评估保持有序消费和关闭语义的最小候选方案，并使用同样观测开销进行前后比较。
+
+## 9. 优先级
 
 | 优先级 | 后续改动方向 | 证据与验收 |
 |---|---|---|
@@ -193,6 +220,8 @@ CUDA kernel 活动总量基本不变，三个采样 step 的 kernel gap 合计�
 - [显式启动器](benchmarks/oss_profile/launch.py)、[observer](benchmarks/oss_profile/observer.py)、[回环验证](benchmarks/oss_profile/check_observer.py)、[分析器](benchmarks/oss_profile/analyze.py)
 - ECS 历史只读证据在 `/tmp/olmoearth-nano-storage-ab-20261106TEL5zhg/{boto3-oss,mounted-ossfs2-configured}/`，短窗原始 GET/worker/parent JSONL、训练日志及 Kineto gzip trace 在 `/tmp/olmoearth-oss-profile.9CU7rW/olmoearth_pretrain/benchmarks/oss_profile/runs/boto3/`。
 - 本次原始 CPU A/B 日志、1 Hz GPU 采样及 Kineto traces 在 ECS 隔离副本的 `benchmarks/oss_profile/runs/cpu-default-20261107/` 和 `benchmarks/oss_profile/runs/cpu-isolated-20261107/`；本地 evidence 目录保存了可复核的 JSON 汇总。两组都完成关闭验证：GET 开始/结束数相同、无 GET 错误、8 个 worker exit 0、无残留进程或 abort。
+- task ID 诊断的原始日志在 ECS 隔离副本的 `benchmarks/oss_profile/runs/ordered-task-observe-20261107/`；对应分析器为 `benchmarks/oss_profile/ordered_analysis.py`。本次结果包含外部 GPU 活动，不是有效的性能对照。
+- 两轮干净诊断的原始日志在同一隔离副本的 `benchmarks/oss_profile/runs/ordered-task-clean2/` 和 `ordered-task-clean3/`；本地未提交的 `benchmarks/oss_profile/evidence/ordered-clean2-*.json` 和 `ordered-clean3-*.json` 含逐 task 摘要、窗口指标和关闭校验。
 - epoch 索引 SHA-256 为 `f2f45ca21b6546692cffeac40d2493fb3edf695d174260ac074e5b0b4f6465f6`，原始 trace SHA-256 为 `b25943d774310cdc1b63fe13c3dd5a95ae64ba5b0985d221b5a6f7a3f0600190`。
 
 在 ECS 的隔离 worktree 内，通过已有的私有凭据包装器启动。启动器把步数限制在 24 以内，每次要求新的输出目录。

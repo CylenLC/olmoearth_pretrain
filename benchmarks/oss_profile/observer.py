@@ -19,6 +19,7 @@ _batch = 0
 _step = None
 _sample_pattern = re.compile(r"sample_(\d+)\.h5$")
 _patches = set()
+_request_seq = 0
 
 
 def _cpu_list(value):
@@ -75,7 +76,9 @@ def emit(event, **fields):
     """Write allowlisted measurements and never serialize exception messages."""
     _stream.write(json.dumps({
         "event": event, "ns": clock(), "pid": os.getpid(),
-        "tid": threading.get_native_id(), "worker": _worker, **fields,
+        "tid": threading.get_native_id(), "worker": _worker,
+        "task_id": getattr(_state, "task_id", None),
+        "request_id": getattr(_state, "request_id", None), **fields,
     }, separators=(",", ":")) + "\n")
 
 
@@ -181,6 +184,8 @@ def worker_init(worker_id):
     import h5py
     import torch
     from torch.utils.data._utils.fetch import _IterableDatasetFetcher
+    from multiprocessing.queues import Queue
+    from concurrent.futures import ThreadPoolExecutor
 
     from olmoearth_pretrain.data import dataloader
     from olmoearth_pretrain.data.dataloader import _OSSGetPrefetcher, OlmoEarthDataLoader
@@ -196,6 +201,46 @@ def worker_init(worker_id):
     emit("affinity", **affinity)
     faulthandler.enable(all_threads=True)
     install_get()
+    original_queue_get, original_queue_put = Queue.get, Queue.put
+    worker_tid = threading.get_native_id()
+
+    def queue_get(self, *args, **kwargs):
+        result = original_queue_get(self, *args, **kwargs)
+        if (threading.get_native_id() == worker_tid and isinstance(result, tuple)
+                and len(result) == 2 and isinstance(result[0], int)):
+            _state.task_id = result[0]
+            emit("worker_task_received")
+        return result
+
+    def queue_put(self, value, *args, **kwargs):
+        if (threading.get_native_id() == worker_tid and isinstance(value, tuple)
+                and len(value) == 2 and isinstance(value[0], int)):
+            start = clock()
+            try:
+                return original_queue_put(self, value, *args, **kwargs)
+            finally:
+                emit("worker_result_queued", task_id=value[0], start_ns=start, end_ns=clock())
+        return original_queue_put(self, value, *args, **kwargs)
+
+    Queue.get, Queue.put = queue_get, queue_put
+    original_thread_submit = ThreadPoolExecutor.submit
+
+    def thread_submit(self, fn, *args, **kwargs):
+        if getattr(self, "_thread_name_prefix", "") != "olmoearth-oss-get":
+            return original_thread_submit(self, fn, *args, **kwargs)
+        task_id = getattr(_state, "task_id", None)
+        request_id = getattr(_state, "request_id", None)
+
+        def run():
+            _state.task_id, _state.request_id = task_id, request_id
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _state.task_id = _state.request_id = None
+
+        return original_thread_submit(self, run)
+
+    ThreadPoolExecutor.submit = thread_submit
     dataset = torch.utils.data.get_worker_info().dataset
     loader = dataset.data_loader
     original_collate = loader.collator
@@ -219,7 +264,15 @@ def worker_init(worker_id):
         return result
 
     def submit(self, path):
-        future = original_submit(self, path)
+        global _request_seq
+        _request_seq += 1
+        request_id = _request_seq
+        _state.request_id = request_id
+        try:
+            future = original_submit(self, path)
+        finally:
+            _state.request_id = None
+        emit("future_submitted", request_id=request_id)
         original_result = future.result
         match = _sample_pattern.search(path.name)
         sample = int(match[1]) if match else None
@@ -230,6 +283,8 @@ def worker_init(worker_id):
                 return original_result(*args, **kwargs)
             finally:
                 _state.wait_ns = clock() - start
+                emit("future_result", request_id=request_id, start_ns=start,
+                     end_ns=start+_state.wait_ns)
                 if _state.wait_ns >= 10_000_000:
                     emit("ordered_wait", batch=_batch, sample=sample,
                          start_ns=start, end_ns=start+_state.wait_ns)
@@ -296,6 +351,7 @@ def install_training(first, last, affinity):
     """Attach the profiler to real steps only. No synchronization inside phases."""
     import torch
     from torch.utils.data.dataloader import _MultiProcessingDataLoaderIter
+    from torch.utils.data._utils import pin_memory
 
     from olmoearth_pretrain.data import dataloader
     from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample
@@ -314,6 +370,62 @@ def install_training(first, last, affinity):
     _original_worker_init = dataloader._worker_ignore_sigterm
     dataloader._worker_ignore_sigterm = worker_init
     install_get()
+    original_pin_loop = pin_memory._pin_memory_loop
+
+    class QueueObserver:
+        def __init__(self, queue, direction):
+            self.queue, self.direction = queue, direction
+
+        def __getattr__(self, name):
+            return getattr(self.queue, name)
+
+        def get(self, *args, **kwargs):
+            result = self.queue.get(*args, **kwargs)
+            if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], int):
+                _state.task_id = result[0]
+                emit("ipc_received")
+            return result
+
+        def put(self, value, *args, **kwargs):
+            result = self.queue.put(value, *args, **kwargs)
+            if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], int):
+                emit("pin_output", task_id=value[0])
+                _state.task_id = None
+            return result
+
+    def pin_loop(in_queue, out_queue, *args):
+        return original_pin_loop(QueueObserver(in_queue, "in"),
+                                 QueueObserver(out_queue, "out"), *args)
+
+    pin_memory._pin_memory_loop = pin_loop
+    original_dispatch = _MultiProcessingDataLoaderIter._try_put_index
+    original_get_data = _MultiProcessingDataLoaderIter._get_data
+    original_process_data = _MultiProcessingDataLoaderIter._process_data
+
+    def dispatch(self):
+        task_id = self._send_idx
+        result = original_dispatch(self)
+        if self._send_idx != task_id:
+            emit("task_dispatched", task_id=task_id, target_worker=self._task_info[task_id][0])
+        return result
+
+    def get_data(self):
+        start = clock()
+        result = original_get_data(self)
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], int):
+            emit("parent_queue_received", task_id=result[0], expected_task_id=self._rcvd_idx,
+                 start_ns=start, end_ns=clock())
+        return result
+
+    def process_data(self, data, worker_idx):
+        task_id = self._rcvd_idx - 1
+        result = original_process_data(self, data, worker_idx)
+        emit("consumer_delivered", task_id=task_id, target_worker=worker_idx, step=_step)
+        return result
+
+    _MultiProcessingDataLoaderIter._try_put_index = dispatch
+    _MultiProcessingDataLoaderIter._get_data = get_data
+    _MultiProcessingDataLoaderIter._process_data = process_data
     root = Path(os.environ["OSS_PROFILE_OUTPUT"])
     state = {}
     original_pre_load = OlmoEarthSpeedMonitorCallback.pre_load_batch
