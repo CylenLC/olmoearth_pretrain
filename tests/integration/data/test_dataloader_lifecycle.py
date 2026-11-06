@@ -13,6 +13,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -515,6 +516,62 @@ class DataLoaderLifecycleTests(unittest.TestCase):
         iterator.close()
         self.assert_closed(workers)
         self.assertIsNone(loader._torch_loader)
+
+    @unittest.skipUnless("fork" in mp.get_all_start_methods(), "requires fork")
+    def test_early_close_waits_for_inflight_oss_gets_before_shutdown(self):
+        """Stop refilling GETs and keep the result consumer alive until they finish."""
+        context = mp.get_context("fork")
+        started = context.Value("i", 0)
+        completed = context.Value("i", 0)
+        blocked = context.Event()
+        release = context.Event()
+
+        def slow_get(path, on_client_create):
+            with started.get_lock():
+                started.value += 1
+                request = started.value
+            if request == 6:
+                blocked.set()
+            if request > 4:
+                if not release.wait(15):
+                    raise RuntimeError("test did not release blocked GET")
+            payload = _read_local_h5_as_oss(path, on_client_create)
+            with completed.get_lock():
+                completed.value += 1
+            return payload
+
+        with (
+            patch.object(dataloader_module, "_is_oss_full_get_path", return_value=True),
+            patch.object(dataloader_module, "_download_oss_payload", slow_get),
+        ):
+            loader = self.loader(workers=1, inflight=2, context="fork")
+            loader.reshuffle(1)
+            batches = iter(loader)
+            next(batches)
+            self.assertTrue(blocked.wait(5), "expected a prefetched GET in flight")
+            workers = self.workers(loader)
+            native = loader._torch_loader._iterator
+            shutdown = native._shutdown_workers
+            completed_at_shutdown = []
+
+            def observe_shutdown():
+                completed_at_shutdown.append(completed.value)
+                shutdown()
+
+            # Keep the GET blocked beyond the previous five-second drain cutoff.
+            timer = threading.Timer(5.5, release.set)
+            timer.start()
+            try:
+                with patch.object(native, "_shutdown_workers", observe_shutdown):
+                    batches.close()
+            finally:
+                release.set()
+                timer.cancel()
+                timer.join()
+            self.assertEqual(completed_at_shutdown, [6])
+            self.assertEqual(started.value, 6, "close must not refill the GET window")
+            self.assertEqual(loader.batches_processed, 1)
+            self.assert_closed(workers)
 
     def test_active_epoch_cannot_be_overwritten(self):
         """Reject overlapping iterators/reshuffle without damaging the active epoch."""

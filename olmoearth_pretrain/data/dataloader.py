@@ -9,11 +9,11 @@ import multiprocessing as mp
 import random
 import signal
 import threading
-import time
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from itertools import takewhile
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,9 @@ from olmoearth_pretrain.nn.tokenization import TokenizationConfig
 from olmoearth_pretrain.train.masking import MaskingConfig, MaskingStrategy
 
 logger = logging.getLogger(__name__)
+
+# Allow an in-flight OSS call to finish, including its configured SDK retries.
+_WORKER_DRAIN_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -281,6 +284,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
         self.max_inflight_oss_gets_per_worker = max_inflight_oss_gets_per_worker
         self._torch_loader: torch.utils.data.DataLoader | None = None
         self._epoch_state: Any = None
+        self._worker_stop: Any = None
         self._runtime_signature: tuple | None = None
         self._runtime_generation = 0
         self._active_iteration: object | None = None
@@ -540,15 +544,19 @@ class OlmoEarthDataLoader(DataLoaderBase):
             context = mp.get_context(self.multiprocessing_context)
             # generation, epoch, seed, consumed batches at this iteration's start.
             self._epoch_state = context.Array("q", [0, 0, 0, 0])
+            self._worker_stop = context.Event()
             # Never pickle the parent's loader/iterator/queues into spawn workers,
             # nor form wrapper -> parent -> cached torch loader reference cycles.
             view = copy.copy(self)
             view._torch_loader = None
             view._epoch_state = None
+            view._worker_stop = None
             view._runtime_signature = None
             view._active_iteration = None
             self._torch_loader = torch.utils.data.DataLoader(
-                _IterableDatasetWrapper(view, epoch_state=self._epoch_state),
+                _IterableDatasetWrapper(
+                    view, epoch_state=self._epoch_state, stop_event=self._worker_stop
+                ),
                 batch_size=None,
                 num_workers=self.num_workers,
                 pin_memory=self.target_device_type == "cuda",
@@ -605,34 +613,38 @@ class OlmoEarthDataLoader(DataLoaderBase):
         shutdown boundary here; ignored SIGTERM requires a bounded kill fallback.
         This is for completion, failure or restore, never a normal epoch boundary.
         """
-        loader = self._torch_loader
+        loader, stop = self._torch_loader, self._worker_stop
         self._torch_loader = None
         self._epoch_state = None
+        self._worker_stop = None
         self._runtime_signature = None
         self._active_iteration = None
         self._runtime_generation += 1
         iterator = getattr(loader, "_iterator", None)
         if iterator is not None:
             try:
-                # Stop scheduling and receive only already-dispatched prefetch.
-                # Shutting down while a worker's tensor queue is still sending
-                # can abort its C++ sender thread. Do not drain an entire epoch.
+                # Keep pinning and reconstructing queued tensors until workers
+                # acknowledge the stop. A worker may still be inside a GET.
                 iterator._try_put_index = lambda: None
+                stop.set()
                 original_timeout = iterator._timeout
-                deadline = time.monotonic() + 5
+                iterator._timeout = _WORKER_DRAIN_TIMEOUT_SECONDS
                 try:
-                    while time.monotonic() < deadline:
-                        iterator._timeout = max(0.01, deadline - time.monotonic())
+                    while True:
+                        received = iterator._rcvd_idx
                         try:
                             next(iterator)
                         except StopIteration:
                             break
-                except Exception:
-                    # The caller may already be handling a failed fetch. Cleanup
-                    # must still shut down workers instead of replaying that error.
-                    logger.debug(
-                        "Discarding failed prefetch during close", exc_info=True
-                    )
+                        except Exception:
+                            if iterator._rcvd_idx == received:
+                                logger.warning(
+                                    "DataLoader drain stalled during close",
+                                    exc_info=True,
+                                )
+                                break
+                            # A failed prefetched batch was consumed. Keep
+                            # draining other workers without replaying its error.
                 finally:
                     iterator._timeout = original_timeout
             finally:
@@ -642,6 +654,9 @@ class OlmoEarthDataLoader(DataLoaderBase):
                     for worker in iterator._workers:
                         worker.join(timeout=5)
                         if worker.is_alive():
+                            logger.warning(
+                                "Killing stalled DataLoader worker %s", worker.pid
+                            )
                             worker.kill()
                             worker.join(timeout=5)
 
@@ -971,10 +986,16 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
     This is a modified version of olmo_core.data.data_loader._IterableDatasetWrapper
     """
 
-    def __init__(self, data_loader: OlmoEarthDataLoader, epoch_state: Any = None):
+    def __init__(
+        self,
+        data_loader: OlmoEarthDataLoader,
+        epoch_state: Any = None,
+        stop_event: Any = None,
+    ):
         """Initialize the IterableDatasetWrapper."""
         self.data_loader = data_loader
         self.epoch_state = epoch_state
+        self.stop_event = stop_event
         self._reset_shape_rngs()
         # Dataloader-side masking configuration
         self.transform = data_loader.transform
@@ -982,6 +1003,9 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
         self.masking_strategy_b = data_loader.masking_strategy_b
         self.num_masked_views = data_loader.num_masked_views
         self._oss_get_prefetcher: _OSSGetPrefetcher | None = None
+
+    def _stop_requested(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
 
     def _reset_shape_rngs(self) -> None:
         """Keep the existing epoch/rank/worker PCG64 shape sampling formula."""
@@ -1203,7 +1227,7 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
     def _iter_prefetched_dataset_items(
         self,
         params: Iterator[tuple[int, int, int, int, int | None]],
-    ) -> Iterator[tuple[tuple[int, OlmoEarthSample], int | None]]:
+    ) -> Generator[tuple[tuple[int, OlmoEarthSample], int | None], None, None]:
         """Download a bounded lookahead while consuming samples in sampler order."""
         if self._oss_get_prefetcher is None:
             self._oss_get_prefetcher = _OSSGetPrefetcher(
@@ -1236,12 +1260,16 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
 
         concurrency = self.data_loader.max_inflight_oss_gets_per_worker
         try:
+            if self._stop_requested():
+                return
             for _ in range(concurrency):
                 if not submit_next():
                     break
             while pending:
                 future, path, item_params = pending.popleft()
                 payload = future.result()
+                if self._stop_requested():
+                    return
                 # Refill the freed slot before HDF5 decoding and sample building.
                 submit_next()
                 idx, patch_size, sampled_hw_p, target_t, location_patch_size = (
@@ -1258,6 +1286,34 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
             # possible. Running reads finish before the worker's executor closes.
             for future, _, _ in pending:
                 future.cancel()
+
+    def _iter_collated_batches(
+        self,
+        items: Generator[tuple[tuple[int, OlmoEarthSample], int | None], None, None],
+    ) -> Iterator[Any]:
+        """Discard work at the stop boundary before returning tensors to PyTorch."""
+        try:
+            for batch in iter_batched(
+                items,  # type: ignore[arg-type]
+                self.data_loader.rank_batch_size,
+                self.data_loader.drop_last,
+            ):
+                if self._stop_requested():
+                    return
+                result = (
+                    *self.data_loader.collator([item for item, _ in batch]),
+                    batch[0][1],
+                )
+                if self._stop_requested():
+                    return
+                yield result
+                del result
+        finally:
+            items.close()
+            if self._stop_requested() and self._oss_get_prefetcher is not None:
+                # Report exhaustion only after queued futures are cancelled and
+                # active ones have released their response bodies and clients.
+                self._oss_get_prefetcher.close()
 
     def __iter__(self) -> Iterator[Any]:
         """Iterate over the dataset.
@@ -1290,6 +1346,8 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
         ):
             instance_iterator = self._iter_prefetched_dataset_items(item_params)
         else:
+            if self.stop_event is not None:
+                item_params = takewhile(lambda _: not self._stop_requested(), item_params)
             instance_iterator = (
                 (
                     self.data_loader._get_dataset_item(
@@ -1306,17 +1364,7 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
                 ) in item_params
             )
 
-        return (
-            (
-                *self.data_loader.collator([item for item, _ in batch]),
-                batch[0][1],
-            )
-            for batch in iter_batched(
-                instance_iterator,  # type: ignore[arg-type]
-                self.data_loader.rank_batch_size,
-                self.data_loader.drop_last,
-            )
-        )
+        return self._iter_collated_batches(instance_iterator)
 
 
 @dataclass
