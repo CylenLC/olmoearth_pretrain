@@ -134,3 +134,13 @@ Not verified: successful CUDA Nano training/resume, GPU telemetry, real multi-ra
 execution (rank guards are unit-tested), ECS connectivity, real OSS checkpoint
 writes, downstream evaluation algorithms, live W&B service, or MLflow 3.x server
 compatibility. No model/loss/optimizer/DataLoader or OLMo-core source was changed.
+
+## Review follow-up
+
+The full feature diff was reviewed against the official base. Follow-up fixes
+preserve checkpoint identity while tracking is temporarily disabled, redact
+structured CLI credentials and case-varied name/value records, use opaque hashed
+evaluation artifact directory names, and prevent out-of-order asynchronous saves
+from moving the latest checkpoint URI tag backwards within a process.
+Regression coverage now contains 30 passing tests, including strict failure
+propagation from Future callbacks. Hardware/service validation limits above remain.
