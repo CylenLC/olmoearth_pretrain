@@ -87,6 +87,12 @@ url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [project.optional-dependencies]
+mlflow = [
+    # Tracking client only; the server is deployed separately.
+    "mlflow-skinny>=2.22.5,<3",
+    "psutil>=7.1.1",
+    "nvidia-ml-py>=12",
+]
 training = [
     "ai2-olmo-core==2.6.0",
     "albumentations>=1.4.10",

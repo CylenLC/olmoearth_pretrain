@@ -37,6 +37,7 @@ from olmoearth_pretrain.internal.utils import (
     MockOlmoEarthDataLoader,
 )
 from olmoearth_pretrain.nn.tokenization import TokenizationConfig
+from olmoearth_pretrain.train.callbacks.mlflow import OlmoEarthMLflowCallback
 from olmoearth_pretrain.train.train_module.train_module import (
     OlmoEarthTrainModuleConfig,
 )
@@ -219,6 +220,7 @@ def build_config(
     dataset_config = dataset_config_builder(common)
     dataloader_config = dataloader_config_builder(common)
     trainer_config = trainer_config_builder(common)
+    trainer_config.callbacks.setdefault("mlflow", OlmoEarthMLflowCallback())
     train_module_config = train_module_config_builder(common)
     visualize_config = (
         visualize_config_builder(common) if visualize_config_builder else None
@@ -254,6 +256,9 @@ def build_evaluate_config(
     logger.info("Common: %s", common)
     model_config = model_config_builder(common)
     trainer_config = trainer_config_builder(common)
+    trainer_config.callbacks.setdefault(
+        "mlflow", OlmoEarthMLflowCallback(evaluation_only=True)
+    )
     train_module_config = (
         train_module_config_builder(common) if train_module_config_builder else None
     )
@@ -324,10 +329,26 @@ def train(config: OlmoEarthExperimentConfig) -> None:
     )
     trainer = config.trainer.build(train_module, data_loader)
 
-    # Record the config to W&B/Comet and each checkpoint dir.
+    # Record the config to tracking callbacks and each checkpoint dir.
     config_dict = config.as_config_dict()
     cast(WandBCallback, trainer.callbacks["wandb"]).config = config_dict
     cast(ConfigSaverCallback, trainer.callbacks["config_saver"]).config = config_dict
+    mlflow_callback = trainer.callbacks.get("mlflow")
+    if isinstance(mlflow_callback, OlmoEarthMLflowCallback) and mlflow_callback.enabled:
+        mlflow_callback.config = config_dict
+        mlflow_callback.run_name = mlflow_callback.run_name or config.run_name
+        mlflow_callback.dataset_name = mlflow_callback.dataset_name or "OlmoEarth"
+        mlflow_callback.dataset_uri = mlflow_callback.dataset_uri or getattr(
+            config.dataset, "h5py_dir", None
+        )
+        if mlflow_callback.dataset_num_samples is None:
+            # The existing loader has already prepared the dataset; len is metadata only.
+            mlflow_callback.dataset_num_samples = len(dataset)
+        if not mlflow_callback.dataset_preprocessing:
+            mlflow_callback.dataset_preprocessing = {
+                "dataset": config_dict["dataset"],
+                "data_loader": config_dict["data_loader"],
+            }
     trainer.fit()
 
 
@@ -356,10 +377,14 @@ def evaluate(config: OlmoEarthEvaluateConfig) -> None:
 
     train_module.model = model
     trainer = config.trainer.build(train_module, data_loader)
-    # Record the config to W&B/Comet and each checkpoint dir.
+    # Record the config to tracking callbacks and each checkpoint dir.
     config_dict = config.as_config_dict()
     cast(WandBCallback, trainer.callbacks["wandb"]).config = config_dict
     cast(ConfigSaverCallback, trainer.callbacks["config_saver"]).config = config_dict
+    mlflow_callback = trainer.callbacks.get("mlflow")
+    if isinstance(mlflow_callback, OlmoEarthMLflowCallback) and mlflow_callback.enabled:
+        mlflow_callback.config = config_dict
+        mlflow_callback.run_name = mlflow_callback.run_name or config.run_name
     trainer.fit()
 
 
