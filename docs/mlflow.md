@@ -51,7 +51,7 @@ python scripts/tools/validate_mlflow_ecs.py
 脚本依次执行真实 Nano 两步训练、恢复至第三步、从两份 Trainer state 核对
 Run ID、查询第三步指标及 GPU 利用率/显存指标；再连接本机保留但未监听的端口，
 检查 warn 模式仍完成两步训练并保存 Checkpoint。不会停止真实 Tracking Server。
-这是启动时服务不可达测试，不等同于训练中途断网。每段日志和 `result.json`
+此外，脚本通过仅绑定 127.0.0.1 的本地代理，在第 1 步训练指标成功上传后关闭后续客户端连接，验证训练继续到第 3 步、Run ID 保留且记录降级警告。断连后通过原始地址读取 Run，确认真实服务端仍可用。不会停止服务、修改防火墙或影响其他训练客户端。代理不覆盖 artifact 存储链路；本测试针对 Tracking API 断连。测试 Run 可能因无法发送结束请求而保持 RUNNING，这是故障场景的预期结果。每段日志和 `result.json`
 保存在验证目录；失败返回非零退出码，保留证据。
 
 ## Nano 单独运行与恢复
@@ -133,3 +133,51 @@ uv lock --check
 本机仅有 CPU，官方 Nano 在 CUDA 显存统计处失败。ECS 自动脚本尚未在 GPU
 机器实跑；真实多进程、GPU 监控、ECS/OSS、下游算法、在线 W&B 和 MLflow 3.x
 服务端兼容性仍需验证。未修改模型、Loss、优化器、DataLoader 或 OLMo-core 源码。
+
+
+## 本轮审查补充
+
+GPU 检查要求同一设备分别存在计算利用率和显存 MB 指标，避免仅有显存利用率时误判。
+验证进程的 HTTP 请求统一限制为 2 秒、零重试，artifact 超时 5 秒。
+`MLFLOW_VALIDATION_TIMEOUT` 控制每段训练的最长时间，默认 1800 秒；超时只结束
+本验证任务创建的进程组（含 Nano 子进程）。GPU/连接预检查失败不会创建结果目录。
+代理只支持 HTTP(S) Tracking URI；认证请使用环境变量，URI 不得包含用户名、密码或查询参数。
+自签名证书使用 `MLFLOW_TRACKING_SERVER_CERT_PATH`，不自动关闭证书校验。
+CPU 回归测试使用一次性本地 HTTP 服务验证中途断连、真实 Callback 降级、
+服务端仍可访问、GPU 指标判据及进程树超时清理；不代表 GPU Nano 端到端已经通过。
+
+## 训练时启用和查看 MLflow
+
+已有训练环境安装客户端后，在原训练命令后添加以下参数即可：
+
+```bash
+pip install -e '.[mlflow]'
+export MLFLOW_TRACKING_URI=http://127.0.0.1:5000
+# 追加到原有 Nano/其他训练命令：
+# --trainer.callbacks.mlflow.enabled=true
+# --trainer.callbacks.mlflow.experiment_name=olmoearth
+# --trainer.callbacks.mlflow.run_name=nano-test
+# --trainer.callbacks.mlflow.log_interval=1
+# --trainer.callbacks.wandb.enabled=false
+```
+
+MLflow 默认关闭；W&B 开关独立，最后一行仅在需要关闭 W&B 时使用。
+启动日志会显示 MLflow Run ID。在浏览器打开服务端地址，进入 Experiments，
+选择配置的 Experiment，再打开对应 Run 的 Metrics，查看 Loss、LR、梯度范数、
+吞吐和 system/gpu_* 指标。训练指标横轴选择 Step；系统指标按采样序号或时间查看。
+参数和配置见 Parameters / Artifacts；Checkpoint JSON 只包含 URI，不包含权重。
+选中同一 Experiment 的多个 Run 可比较指标。恢复训练使用相同服务端和原 Checkpoint，
+原 Run 内会继续出现后续 Step。
+
+如果浏览器在自己的电脑、服务端在 ECS，在自己的电脑建立隧道：
+
+```bash
+ssh -N -L 15000:127.0.0.1:5000 USER@ECS_HOST
+```
+
+然后打开 `http://127.0.0.1:15000`。这是浏览器连接，和训练主机使用的
+`MLFLOW_TRACKING_URI` 分开设置；不要把自己电脑的 localhost 地址当成 ECS 地址。
+
+2026-11-18 本地验证：`python -m pytest tests_mlflow -q` 共 39 项通过，
+包含本轮新增的 9 项 ECS 工具回归案例；新增/修改脚本 Ruff、格式和语法检查通过。
+这些是 CPU 上的客户端与工具测试，未在 GPU 上运行完整 Nano 验证脚本。
