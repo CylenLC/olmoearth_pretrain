@@ -849,3 +849,21 @@ class TestCollateDoubleMaskedBatched:
         assert isinstance(collated_b, MaskedOlmoEarthSample)
         assert collated_a.sentinel2_l2a_mask is not None
         assert collated_b.sentinel2_l2a_mask is not None
+
+
+
+def test_affinity_worker_initializer_preserves_signal_handler(monkeypatch):
+    """The opt-in worker initializer delegates to the normal SIGTERM handler."""
+    from olmoearth_pretrain.data import dataloader
+
+    calls = []
+    monkeypatch.setattr(
+        dataloader, "_worker_ignore_sigterm", lambda worker_id: calls.append(worker_id)
+    )
+    monkeypatch.setattr(dataloader, "_set_cpu_affinity", calls.append)
+    loader = object.__new__(dataloader.OlmoEarthDataLoader)
+    loader.worker_cpu_affinity = ()
+    assert loader._worker_init_fn() is dataloader._worker_ignore_sigterm
+    loader.worker_cpu_affinity = (4, 5)
+    loader._worker_init_fn()(3)
+    assert calls == [3, (4, 5)]

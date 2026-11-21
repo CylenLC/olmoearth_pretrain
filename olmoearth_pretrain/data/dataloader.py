@@ -6,6 +6,7 @@ import functools
 import logging
 import math
 import multiprocessing as mp
+import os
 import random
 import signal
 import threading
@@ -122,6 +123,24 @@ def _worker_ignore_sigterm(worker_id: int) -> None:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 
+def _set_cpu_affinity(cpus: Iterable[int]) -> None:
+    """Set all existing Linux process threads; new threads inherit the mask."""
+    mask = set(cpus)
+    for thread in Path("/proc/self/task").iterdir():
+        try:
+            os.sched_setaffinity(int(thread.name), mask)
+        except ProcessLookupError:
+            continue
+    if os.sched_getaffinity(0) != mask:
+        raise RuntimeError(f"CPU affinity did not match the requested mask {sorted(mask)}")
+
+
+def _initialize_worker_with_affinity(worker_id: int, *, cpus: tuple[int, ...]) -> None:
+    _worker_ignore_sigterm(worker_id)
+    _set_cpu_affinity(cpus)
+    logger.info("DataLoader worker %d CPU affinity: %s", worker_id, sorted(cpus))
+
+
 class OlmoEarthDataLoader(DataLoaderBase):
     """OlmoEarth Pretrain dataloader.
 
@@ -165,6 +184,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
         tokenization_config: TokenizationConfig | None = None,
         reuse_workers_across_epochs: bool = False,
         max_inflight_oss_gets_per_worker: int = 2,
+        worker_cpu_affinity: list[int] | None = None,
     ):
         """Initialize the OlmoEarthDataLoader.
 
@@ -241,6 +261,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
             max_inflight_oss_gets_per_worker: Maximum number of complete OSS object
                 downloads each worker may have in flight. Values above one overlap
                 object transfer with ordered HDF5 decoding and sample construction.
+            worker_cpu_affinity: Optional Linux CPU mask for DataLoader workers.
         """
         super().__init__(
             work_dir=work_dir,
@@ -271,6 +292,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
         self.seed = seed
         self.shuffle = shuffle
         self.num_workers = num_workers
+        self.worker_cpu_affinity = tuple(worker_cpu_affinity or ())
         self.prefetch_factor = prefetch_factor
         self.target_device_type = target_device_type
         self.drop_last = drop_last
@@ -466,6 +488,13 @@ class OlmoEarthDataLoader(DataLoaderBase):
         finally:
             batches.close()
 
+    def _worker_init_fn(self) -> Callable[[int], None]:
+        if self.worker_cpu_affinity:
+            return functools.partial(
+                _initialize_worker_with_affinity, cpus=self.worker_cpu_affinity
+            )
+        return _worker_ignore_sigterm
+
     def _iter_batches(self) -> Iterable[OlmoEarthSample]:
         """Iterate over the dataset in batches."""
         if self._can_reuse_workers():
@@ -488,7 +517,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
             multiprocessing_context=(
                 self.multiprocessing_context if self.num_workers > 0 else None
             ),
-            worker_init_fn=_worker_ignore_sigterm if self.num_workers > 0 else None,
+            worker_init_fn=self._worker_init_fn() if self.num_workers > 0 else None,
             timeout=0,
         )
         return map(_unwrap_masked_view_batch, loader) if pin_memory else loader
@@ -509,6 +538,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
             self.dp_rank,
             self.num_workers,
             self.max_inflight_oss_gets_per_worker,
+            self.worker_cpu_affinity,
             self.multiprocessing_context,
             self.prefetch_factor,
             self.target_device_type,
@@ -570,7 +600,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
                 prefetch_factor=self.prefetch_factor,
                 persistent_workers=True,
                 multiprocessing_context=self.multiprocessing_context,
-                worker_init_fn=_worker_ignore_sigterm,
+                worker_init_fn=self._worker_init_fn(),
                 timeout=0,
                 # Match the factory device used by PyTorch's base-seed tensor.
                 generator=torch.Generator(
@@ -1418,6 +1448,7 @@ class OlmoEarthDataLoaderConfig(Config):
     max_location_queries: int | None = None
     reuse_workers_across_epochs: bool = False
     max_inflight_oss_gets_per_worker: int = 2
+    worker_cpu_affinity: list[int] | None = None
 
     def validate(self) -> None:
         """Validate the configuration."""
@@ -1511,6 +1542,7 @@ class OlmoEarthDataLoaderConfig(Config):
             tokenization_config=self.tokenization_config,
             reuse_workers_across_epochs=self.reuse_workers_across_epochs,
             max_inflight_oss_gets_per_worker=self.max_inflight_oss_gets_per_worker,
+            worker_cpu_affinity=self.worker_cpu_affinity,
         )
 
 

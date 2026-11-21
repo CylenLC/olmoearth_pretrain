@@ -192,7 +192,11 @@ def test_shared_training_config_roundtrip(tmp_path) -> None:
 
 @pytest.mark.parametrize(
     ("cluster", "prefix", "prefetch"),
-    (("aliyun", "s3://olmoearth/", 2), ("aliyun-ossfs2", "/mnt/olmoearth/", 4)),
+    (
+        ("aliyun", "s3://olmoearth/", 2),
+        ("aliyun-cpu-isolated", "s3://olmoearth/", 2),
+        ("aliyun-ossfs2", "/mnt/olmoearth/", 4),
+    ),
 )
 def test_nano_aliyun_storage_profiles(monkeypatch, tmp_path, cluster, prefix, prefetch):
     """The Nano entry point wires the ECS default and the mounted fallback."""
@@ -217,8 +221,11 @@ def test_nano_aliyun_storage_profiles(monkeypatch, tmp_path, cluster, prefix, pr
     dataset = captured["dataset_config_builder"](common)
     loader = captured["dataloader_config_builder"](common)
     assert str(dataset.h5py_dir_upath).startswith(prefix)
-    assert dataset.oss.use_fsspec == (cluster == "aliyun")
-    assert dataset.oss.fsspec_full_get == (cluster == "aliyun")
+    assert dataset.oss.use_fsspec == (cluster != "aliyun-ossfs2")
+    assert dataset.oss.fsspec_full_get == (cluster != "aliyun-ossfs2")
     assert loader.prefetch_factor == prefetch
     assert loader.max_inflight_oss_gets_per_worker == 2
     assert loader.num_workers == 16 and loader.global_batch_size == 512
+    assert loader.worker_cpu_affinity == (
+        list(range(4, 16)) if cluster == "aliyun-cpu-isolated" else None
+    )

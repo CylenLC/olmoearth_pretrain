@@ -148,6 +148,21 @@ Use `aliyun-ossfs2` in the same command to select the mounted reader with
 Switch backends explicitly between runs. Other cluster selectors use the
 shared v1.2 recipe.
 
+### Optional CPU isolation on Alibaba ECS
+
+Use `aliyun-cpu-isolated` in place of `aliyun` to keep Full GET and the same
+training settings while assigning CPUs 0–3 to the training process and
+CPUs 4–15 to the DataLoader workers. This profile supports a single Linux
+training rank on the measured eight-core topology with adjacent SMT sibling
+pairs and all sixteen logical CPUs available. The regular `aliyun` profile
+uses the system's default scheduling.
+
+In a 64-step L20 comparison, isolation increased throughput from 211.8 to
+228.2 samples/s over steps 5–64. Batch wait p95 rose from 1.64 ms to 163.51 ms.
+Three steps waited more than one second, with a longest wait of 8.29 s.
+Compare both steady throughput and the frequency and duration of long
+batch waits when choosing this profile.
+
 ## Nano short-run comparison
 
 From the checkout and training environment, use the same saved single-GPU Nano
