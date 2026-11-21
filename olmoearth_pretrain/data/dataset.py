@@ -20,6 +20,7 @@ import h5py
 import hdf5plugin  # noqa: F401
 import numpy as np
 import pandas as pd
+from fsspec import AbstractFileSystem
 from olmo_core.data.utils import get_rng
 from torch.utils.data import Dataset
 from upath import UPath
@@ -101,6 +102,12 @@ def _download_oss_payload(
     return payload
 
 
+def _download_fsspec_payload(path: UPath, fs: AbstractFileSystem) -> bytes:
+    """Buffer one object using the worker's existing fsspec filesystem."""
+    with fs.open(path.path, "rb") as stream:
+        return stream.read()
+
+
 @contextmanager
 def _use_prefetched_oss_payload(path: UPath, payload: bytes):
     """Supply one downloaded object to the normal Dataset parsing path."""
@@ -119,15 +126,15 @@ def _use_prefetched_oss_payload(path: UPath, payload: bytes):
 
 
 @contextmanager
-def _open_h5_file(path: UPath):
-    """Read OSS objects fully while retaining normal UPath behavior elsewhere."""
+def _open_h5_file(path: UPath, *, use_fsspec: bool = False):
+    """Open an HDF5 stream using buffered bytes or the configured backend."""
     prefetched = getattr(_oss_clients, "prefetched_payload", None)
     if prefetched is not None and prefetched[0] == str(path):
         with io.BytesIO(prefetched[1]) as stream:
             yield stream
         return
 
-    if not _is_oss_full_get_path(path):
+    if use_fsspec or not _is_oss_full_get_path(path):
         with path.open("rb") as stream:
             yield stream
         return
@@ -500,6 +507,7 @@ class OlmoEarthDataset(Dataset):
         seed: int = 0,
         apply_cutmix: bool = False,
         filter_idx_file: str | None = None,
+        use_fsspec: bool = False,
     ):
         """Initialize the dataset.
 
@@ -525,11 +533,13 @@ class OlmoEarthDataset(Dataset):
             seed: For selecting the dataset percentage.
             apply_cutmix: Whether or not to apply CutMix augmentation during subsetting.
             filter_idx_file: If not None, filters indices by the values in this numpy array
+            use_fsspec: Use the UPath/fsspec reader for Alibaba OSS HDF5 objects.
 
         Returns:
             None
         """
         self.h5py_dir = h5py_dir
+        self.use_fsspec = use_fsspec
         if not self.h5py_dir.exists():
             raise FileNotFoundError(f"H5PY directory does not exist: {self.h5py_dir}")
         self.cache_dir = cache_dir
@@ -925,7 +935,7 @@ class OlmoEarthDataset(Dataset):
             self._apply_throttling()
 
         sample_dict = {}
-        with _open_h5_file(h5_file_path) as f:
+        with _open_h5_file(h5_file_path, use_fsspec=self.use_fsspec) as f:
             with h5py.File(f, "r") as h5file:
                 logger.debug(
                     f"Reading h5 file {h5_file_path} with keys {h5file.keys()}"
@@ -1094,6 +1104,8 @@ class OSSConfig(Config):
     endpoint_url: str | None = None
     region: str | None = None
     profile: str | None = None
+    # Opt in to s3fs. The DataLoader's per-worker OSS concurrency controls lookahead.
+    use_fsspec: bool = False
 
     def storage_options(self) -> dict[str, Any]:
         """Build options for OSS's virtual-hosted, S3 V2 read interface."""
@@ -1185,6 +1197,7 @@ class OlmoEarthDatasetConfig(Config):
         self.validate()
         kwargs = self.as_dict(exclude_none=True, recurse=False)
         kwargs.pop("oss", None)
+        kwargs["use_fsspec"] = self.oss.use_fsspec
         kwargs["h5py_dir"] = self.h5py_dir_upath
         kwargs["cache_dir"] = (
             self.cache_dir_upath if self.cache_dir is not None else None

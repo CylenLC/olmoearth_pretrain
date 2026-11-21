@@ -59,6 +59,7 @@ def test_oss_full_get_matches_local_hdf5_and_reuses_client(tmp_path, monkeypatch
     monkeypatch.setattr(dataset_module._oss_clients, "client", None, raising=False)
     dataset = object.__new__(OlmoEarthDataset)
     dataset.cache_dir = None
+    dataset.use_fsspec = False
     dataset.sec_per_sample = None
     dataset.training_modalities = ["sentinel1"]
     dataset.dtype = np.float32
@@ -133,6 +134,7 @@ def test_prefetched_oss_payload_uses_normal_hdf5_reader(monkeypatch, tmp_path):
     monkeypatch.setattr(boto3, "Session", unexpected_session)
     dataset = object.__new__(OlmoEarthDataset)
     dataset.cache_dir = None
+    dataset.use_fsspec = False
     dataset.sec_per_sample = None
     dataset.training_modalities = ["sentinel1"]
     dataset.dtype = np.float32

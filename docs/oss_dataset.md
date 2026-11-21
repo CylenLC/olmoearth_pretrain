@@ -57,7 +57,7 @@ export AWS_SECRET_ACCESS_KEY="${OSS_ACCESS_KEY_SECRET:?OSS credential required}"
 No credentials are accepted by `OSSConfig`. Do not put credentials in CLI arguments,
 URIs, training configuration, checked-in `.env` files or logs. The endpoint must
 be an HTTPS origin without userinfo, query parameters or fragments. Configs saved
-by the trainer contain only endpoint, region and optional profile name.
+by the trainer contain the endpoint, region, optional profile name and reader selection.
 
 Alibaba ECS RAM Role credentials are **not** assumed to be part of the AWS default
 credential chain. A future ECS deployment must provide a compatible refreshable
@@ -72,12 +72,17 @@ Use the official worker lifecycle, not `fork` with an initialized S3 client.
 
 ## Behavior and resume
 
-Both backends use the same `UPath.open("rb")` → `h5py.File(file, "r")` path,
-preprocessing, normalization, derived modalities, transforms and collator. CSV
-and NPY metadata use file objects with the same filesystem options. There are no
-new read modes, download paths, full-file buffers, caches or hot-path checks.
-The existing optional Dataset cache stays disabled by default; leave
-`dataset.cache_dir=None` when testing native reads.
+For Alibaba OSS HDF5 files, the default reader uses boto3 Full GET. Set
+`--dataset.oss.use_fsspec=true` to use s3fs for the HDF5 objects. The DataLoader
+uses `--data_loader.max_inflight_oss_gets_per_worker` for either backend. With the
+value at 2, each worker has up to two downloads in flight and decodes buffered
+objects in sampler order. The value 1 uses the synchronous reader. With s3fs
+selected, that is a seekable `UPath.open("rb")` stream. Cached or throttled s3fs
+reads use the normal per-sample reader.
+
+Both modes use the same HDF5 parser, timestep masks, crops, normalization,
+transforms and collator. CSV and NPY metadata use the filesystem options in
+`OSSConfig`. Leave `dataset.cache_dir=None` when comparing native reads.
 
 `filter_idx_file`, loader memmaps/work_dir and training output/checkpoint paths
 retain their existing local behavior. Dataset fingerprints include the storage
@@ -124,3 +129,26 @@ uv run --locked --extra training --extra dev --extra oss --extra beaker pytest \
   tests/unit/data tests/integration/data tests/unit/dataset \
   tests/unit/test_config.py tests/unit/test_checkpoint_configs.py
 ```
+
+## Nano short-run comparison
+
+From the checkout and training environment, use the same saved single-GPU Nano
+fsspec config for both arms. Provide credentials through the AWS provider chain.
+The runner requires an idle GPU, caps the run at 24 steps, disables W&B,
+evaluation and checkpoints, and requires a fresh output directory per arm.
+
+```bash
+export PYTHONPATH="$PWD"
+python benchmarks/oss_h5/nano_ab.py "$nano_config" local_output/nano-oss-a --prefetch off
+python benchmarks/oss_h5/nano_ab.py "$nano_config" local_output/nano-oss-b --prefetch on
+python benchmarks/oss_h5/summarize.py local_output/nano-oss-a local_output/nano-oss-b
+```
+
+The summary includes the first-batch wait and steps 5–24 as the warm window.
+HDF5 dataset-read time subtracts s3fs range-fetch time and includes local copies
+as well as decompression. Worker request and payload counts include work fetched
+ahead of consumption. Summed process RSS can count shared pages more than once.
+
+Run `benchmarks/oss_h5/h5_crop.py --help` for the paired full-read and hyperslab
+comparison on scratch copies of up to ten HDF5 files. The optional OSS arguments
+measure s3fs range-cache activity for the corresponding remote objects.

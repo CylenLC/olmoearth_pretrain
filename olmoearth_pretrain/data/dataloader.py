@@ -20,6 +20,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
+from fsspec import AbstractFileSystem
 from olmo_core.data.data_loader import DataLoaderBase
 from olmo_core.data.utils import get_rng, memmap_to_write
 from olmo_core.distributed.utils import (
@@ -44,6 +45,7 @@ from olmoearth_pretrain.data.dataset import (
     GetItemArgs,
     OlmoEarthDataset,
     OlmoEarthSample,
+    _download_fsspec_payload,
     _download_oss_payload,
     _is_oss_full_get_path,
     _use_prefetched_oss_payload,
@@ -940,7 +942,8 @@ def iter_batched(
 class _OSSGetPrefetcher:
     """Bounded thread pool for complete OSS object downloads in one worker."""
 
-    def __init__(self, concurrency: int):
+    def __init__(self, concurrency: int, fsspec_fs: AbstractFileSystem | None = None):
+        self._fsspec_fs = fsspec_fs
         self._clients: list[Any] = []
         self._clients_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -958,9 +961,11 @@ class _OSSGetPrefetcher:
                 self._clients.append(client)
 
     def submit(self, path: UPath) -> Future[bytes]:
-        return self._executor.submit(
-            _download_oss_payload, path, self._remember_client
-        )
+        if self._fsspec_fs is not None:
+            return self._executor.submit(
+                _download_fsspec_payload, path, self._fsspec_fs
+            )
+        return self._executor.submit(_download_oss_payload, path, self._remember_client)
 
     def close(self) -> None:
         """Wait for active reads, then release each thread's boto client."""
@@ -1214,6 +1219,7 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
         if (
             not isinstance(dataset, OlmoEarthDataset)
             or dataset.cache_dir is not None
+            or (dataset.use_fsspec and dataset.sec_per_sample is not None)
             or len(dataset) == 0
         ):
             return False
@@ -1230,8 +1236,11 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
     ) -> Generator[tuple[tuple[int, OlmoEarthSample], int | None], None, None]:
         """Download a bounded lookahead while consuming samples in sampler order."""
         if self._oss_get_prefetcher is None:
+            dataset = self.dataset
+            # Share one worker-local s3fs client across the download threads.
+            fs = dataset.h5py_dir.fs if dataset.use_fsspec else None
             self._oss_get_prefetcher = _OSSGetPrefetcher(
-                self.data_loader.max_inflight_oss_gets_per_worker
+                self.data_loader.max_inflight_oss_gets_per_worker, fs
             )
         prefetcher = self._oss_get_prefetcher
         pending: deque[

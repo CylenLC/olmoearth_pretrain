@@ -44,7 +44,12 @@ def test_upath_roundtrip_does_not_pickle_credentials(monkeypatch) -> None:
     for secret in (b"test-only-access-key", b"test-only-secret-key"):
         assert secret not in serialized
         assert secret.decode() not in json.dumps(config.as_config_dict())
-    assert {f.name for f in fields(OSSConfig)} == {"endpoint_url", "region", "profile"}
+    assert {f.name for f in fields(OSSConfig)} == {
+        "endpoint_url",
+        "region",
+        "profile",
+        "use_fsspec",
+    }
 
 
 def test_config_serialization_and_cli() -> None:
@@ -58,10 +63,12 @@ def test_config_serialization_and_cli() -> None:
         [
             "oss.endpoint_url=https://s3.oss-cn-beijing.aliyuncs.com",
             "oss.region=cn-beijing",
+            "oss.use_fsspec=true",
         ]
     )
     restored = OlmoEarthDatasetConfig.from_dict(config.as_config_dict())
     assert isinstance(restored.oss, OSSConfig)
+    assert restored.oss.use_fsspec is True
     assert (
         restored.h5py_dir_upath.storage_options == config.h5py_dir_upath.storage_options
     )
