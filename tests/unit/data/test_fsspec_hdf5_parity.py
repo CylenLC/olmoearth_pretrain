@@ -48,7 +48,8 @@ def h5_fixture(tmp_path):
     return dataset, path
 
 
-def test_local_and_fsspec_hdf5_sample_parity(h5_fixture, monkeypatch):
+@pytest.mark.parametrize("full_get", (False, True))
+def test_local_and_fsspec_hdf5_sample_parity(h5_fixture, monkeypatch, full_get):
     """Seekable s3fs and its buffered object produce identical raw and cropped data."""
     pytest.importorskip("s3fs")
     local, local_path = h5_fixture
@@ -141,12 +142,15 @@ def test_local_and_fsspec_hdf5_sample_parity(h5_fixture, monkeypatch):
                 remote_patch, actual = remote[args]
                 np.random.seed(seed)
                 before_buffered = len(requests)
-                prefetcher = _OSSGetPrefetcher(2, remote_path.fs)
+                prefetcher = _OSSGetPrefetcher(2, remote_path.fs, full_get=full_get)
                 try:
                     downloaded = prefetcher.submit(remote_path).result(timeout=5)
                 finally:
                     prefetcher.close()
                 after_download = len(requests)
+                assert downloaded == payload
+                if full_get:
+                    assert requests[before_buffered:after_download] == [("GET", None)]
                 with _use_prefetched_oss_payload(remote_path, downloaded):
                     buffered_patch, buffered = remote[args]
                 assert len(requests) == after_download > before_buffered

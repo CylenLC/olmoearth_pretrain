@@ -100,9 +100,10 @@ def _worker_init(worker_id):
 
         fs.open = fs_open_observed
 
-        def download_observed(path, fs):
+        def download_observed(path, fs, **kwargs):
             start = perf_counter()
-            payload = download(path, fs)
+            _thread.download_open_s = 0.0
+            payload = download(path, fs, **kwargs)
             elapsed = perf_counter() - start
             open_s = _thread.download_open_s
             events.write(

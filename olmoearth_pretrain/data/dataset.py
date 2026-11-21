@@ -102,8 +102,12 @@ def _download_oss_payload(
     return payload
 
 
-def _download_fsspec_payload(path: UPath, fs: AbstractFileSystem) -> bytes:
+def _download_fsspec_payload(
+    path: UPath, fs: AbstractFileSystem, *, full_get: bool = False
+) -> bytes:
     """Buffer one object using the worker's existing fsspec filesystem."""
+    if full_get:
+        return fs.cat_file(path.path)
     with fs.open(path.path, "rb") as stream:
         return stream.read()
 
@@ -508,6 +512,7 @@ class OlmoEarthDataset(Dataset):
         apply_cutmix: bool = False,
         filter_idx_file: str | None = None,
         use_fsspec: bool = False,
+        fsspec_full_get: bool = False,
     ):
         """Initialize the dataset.
 
@@ -534,12 +539,14 @@ class OlmoEarthDataset(Dataset):
             apply_cutmix: Whether or not to apply CutMix augmentation during subsetting.
             filter_idx_file: If not None, filters indices by the values in this numpy array
             use_fsspec: Use the UPath/fsspec reader for Alibaba OSS HDF5 objects.
+            fsspec_full_get: Use a single GET for each prefetched fsspec object.
 
         Returns:
             None
         """
         self.h5py_dir = h5py_dir
         self.use_fsspec = use_fsspec
+        self.fsspec_full_get = fsspec_full_get
         if not self.h5py_dir.exists():
             raise FileNotFoundError(f"H5PY directory does not exist: {self.h5py_dir}")
         self.cache_dir = cache_dir
@@ -1106,6 +1113,7 @@ class OSSConfig(Config):
     profile: str | None = None
     # Opt in to s3fs. The DataLoader's per-worker OSS concurrency controls lookahead.
     use_fsspec: bool = False
+    fsspec_full_get: bool = False
 
     def storage_options(self) -> dict[str, Any]:
         """Build options for OSS's virtual-hosted, S3 V2 read interface."""
@@ -1174,6 +1182,9 @@ class OlmoEarthDatasetConfig(Config):
         Raises:
             ValueError: If any arguments are invalid
         """
+        if self.oss.fsspec_full_get and not self.oss.use_fsspec:
+            raise ValueError("fsspec_full_get requires oss.use_fsspec")
+
         # Validate supported_modalities
         if not isinstance(self.training_modalities, list):
             raise ValueError("training_modalities must be a list")
@@ -1198,6 +1209,7 @@ class OlmoEarthDatasetConfig(Config):
         kwargs = self.as_dict(exclude_none=True, recurse=False)
         kwargs.pop("oss", None)
         kwargs["use_fsspec"] = self.oss.use_fsspec
+        kwargs["fsspec_full_get"] = self.oss.fsspec_full_get
         kwargs["h5py_dir"] = self.h5py_dir_upath
         kwargs["cache_dir"] = (
             self.cache_dir_upath if self.cache_dir is not None else None

@@ -76,7 +76,9 @@ For Alibaba OSS HDF5 files, the default reader uses boto3 Full GET. Set
 `--dataset.oss.use_fsspec=true` to use s3fs for the HDF5 objects. The DataLoader
 uses `--data_loader.max_inflight_oss_gets_per_worker` for either backend. With the
 value at 2, each worker has up to two downloads in flight and decodes buffered
-objects in sampler order. The value 1 uses the synchronous reader. With s3fs
+objects in sampler order. Set `--dataset.oss.fsspec_full_get=true` to use
+a single s3fs `cat_file()` GET for each prefetched object. The value 1 for
+worker concurrency uses the synchronous reader. With s3fs
 selected, that is a seekable `UPath.open("rb")` stream. Cached or throttled s3fs
 reads use the normal per-sample reader.
 
@@ -129,6 +131,22 @@ uv run --locked --extra training --extra dev --extra oss --extra beaker pytest \
   tests/unit/data tests/integration/data tests/unit/dataset \
   tests/unit/test_config.py tests/unit/test_checkpoint_configs.py
 ```
+
+## Alibaba ECS Nano profiles
+
+Use the `aliyun` cluster selector for v1.2 Nano on Alibaba ECS. It defaults to
+the Beijing OSS dataset, s3fs Full GET, two downloads per worker and
+`prefetch_factor=2`. Use the AWS credential provider chain described above.
+
+```bash
+torchrun --standalone --nproc_per_node=1 scripts/official/v1_2/nano.py train RUN_NAME aliyun
+```
+
+Use `aliyun-ossfs2` in the same command to select the mounted reader with
+`prefetch_factor=4`. This profile expects the OSSFS2 dataset at
+`/mnt/olmoearth`, and accepts `--dataset.h5py_dir=...` for another mount.
+Switch backends explicitly between runs. Other cluster selectors use the
+shared v1.2 recipe.
 
 ## Nano short-run comparison
 

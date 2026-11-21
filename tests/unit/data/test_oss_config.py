@@ -49,6 +49,7 @@ def test_upath_roundtrip_does_not_pickle_credentials(monkeypatch) -> None:
         "region",
         "profile",
         "use_fsspec",
+        "fsspec_full_get",
     }
 
 
@@ -64,11 +65,13 @@ def test_config_serialization_and_cli() -> None:
             "oss.endpoint_url=https://s3.oss-cn-beijing.aliyuncs.com",
             "oss.region=cn-beijing",
             "oss.use_fsspec=true",
+            "oss.fsspec_full_get=true",
         ]
     )
     restored = OlmoEarthDatasetConfig.from_dict(config.as_config_dict())
     assert isinstance(restored.oss, OSSConfig)
     assert restored.oss.use_fsspec is True
+    assert restored.oss.fsspec_full_get is True
     assert (
         restored.h5py_dir_upath.storage_options == config.h5py_dir_upath.storage_options
     )
@@ -185,3 +188,37 @@ def test_shared_training_config_roundtrip(tmp_path) -> None:
     assert isinstance(restored.dataset.oss, OSSConfig)
     assert restored.dataset.oss == oss_config()
     assert restored.data_loader.work_dir == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("cluster", "prefix", "prefetch"),
+    (("aliyun", "s3://olmoearth/", 2), ("aliyun-ossfs2", "/mnt/olmoearth/", 4)),
+)
+def test_nano_aliyun_storage_profiles(monkeypatch, tmp_path, cluster, prefix, prefetch):
+    """The Nano entry point wires the ECS default and the mounted fallback."""
+    import runpy
+    import sys
+
+    pytest.importorskip("beaker")
+    pytest.importorskip("s3fs")
+    from olmoearth_pretrain.internal import experiment
+
+    script = Path(__file__).resolve().parents[3] / "scripts/official/v1_2/nano.py"
+    monkeypatch.syspath_prepend(str(script.parent))
+    monkeypatch.setattr(sys, "argv", [str(script), "dry_run", "smoke", cluster])
+    captured = {}
+    monkeypatch.setattr(experiment, "main", lambda **builders: captured.update(builders))
+    runpy.run_path(str(script), run_name="__main__")
+    common = experiment.CommonComponents(
+        run_name="smoke",
+        save_folder=str(tmp_path),
+        training_modalities=["sentinel2_l2a"],
+    )
+    dataset = captured["dataset_config_builder"](common)
+    loader = captured["dataloader_config_builder"](common)
+    assert str(dataset.h5py_dir_upath).startswith(prefix)
+    assert dataset.oss.use_fsspec == (cluster == "aliyun")
+    assert dataset.oss.fsspec_full_get == (cluster == "aliyun")
+    assert loader.prefetch_factor == prefetch
+    assert loader.max_inflight_oss_gets_per_worker == 2
+    assert loader.num_workers == 16 and loader.global_batch_size == 512

@@ -942,8 +942,15 @@ def iter_batched(
 class _OSSGetPrefetcher:
     """Bounded thread pool for complete OSS object downloads in one worker."""
 
-    def __init__(self, concurrency: int, fsspec_fs: AbstractFileSystem | None = None):
+    def __init__(
+        self,
+        concurrency: int,
+        fsspec_fs: AbstractFileSystem | None = None,
+        *,
+        full_get: bool = False,
+    ):
         self._fsspec_fs = fsspec_fs
+        self._full_get = full_get
         self._clients: list[Any] = []
         self._clients_lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -963,7 +970,7 @@ class _OSSGetPrefetcher:
     def submit(self, path: UPath) -> Future[bytes]:
         if self._fsspec_fs is not None:
             return self._executor.submit(
-                _download_fsspec_payload, path, self._fsspec_fs
+                _download_fsspec_payload, path, self._fsspec_fs, full_get=self._full_get
             )
         return self._executor.submit(_download_oss_payload, path, self._remember_client)
 
@@ -1240,7 +1247,9 @@ class _IterableDatasetWrapper(torch.utils.data.IterableDataset[OlmoEarthSample])
             # Share one worker-local s3fs client across the download threads.
             fs = dataset.h5py_dir.fs if dataset.use_fsspec else None
             self._oss_get_prefetcher = _OSSGetPrefetcher(
-                self.data_loader.max_inflight_oss_gets_per_worker, fs
+                self.data_loader.max_inflight_oss_gets_per_worker,
+                fs,
+                full_get=dataset.fsspec_full_get,
             )
         prefetcher = self._oss_get_prefetcher
         pending: deque[
