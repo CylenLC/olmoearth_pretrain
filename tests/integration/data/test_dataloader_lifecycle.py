@@ -573,6 +573,62 @@ class DataLoaderLifecycleTests(unittest.TestCase):
             self.assertEqual(loader.batches_processed, 1)
             self.assert_closed(workers)
 
+    @unittest.skipUnless("fork" in mp.get_all_start_methods(), "requires fork")
+    def test_default_iterator_drains_inflight_oss_before_native_shutdown(self):
+        """A partial epoch drains its GETs even with worker reuse disabled."""
+        from torch.utils.data.dataloader import _MultiProcessingDataLoaderIter
+
+        context = mp.get_context("fork")
+        starts = context.Value("i", 0)
+        finishes = context.Value("i", 0)
+        blocked = context.Event()
+        release = context.Event()
+        workers = []
+        finished_at_shutdown = []
+        shutdown = _MultiProcessingDataLoaderIter._shutdown_workers
+
+        def download(path, on_client_create):
+            with starts.get_lock():
+                starts.value += 1
+                request = starts.value
+                if request == 6:
+                    blocked.set()
+            if request > 4 and not release.wait(10):
+                raise RuntimeError("test did not release blocked GET")
+            payload = _read_local_h5_as_oss(path, on_client_create)
+            with finishes.get_lock():
+                finishes.value += 1
+            return payload
+
+        def observe_shutdown(iterator):
+            if not iterator._shutdown:
+                workers.extend(iterator._workers)
+                finished_at_shutdown.append(finishes.value)
+            return shutdown(iterator)
+
+        with (
+            patch.object(dataloader_module, "_is_oss_full_get_path", return_value=True),
+            patch.object(dataloader_module, "_download_oss_payload", download),
+            patch.object(_MultiProcessingDataLoaderIter, "_shutdown_workers", observe_shutdown),
+        ):
+            loader = self.loader(reuse=False, workers=1, inflight=2, context="fork")
+            loader.reshuffle(1)
+            batches = iter(loader)
+            next(batches)
+            self.assertTrue(blocked.wait(5))
+            timer = threading.Timer(0.25, release.set)
+            timer.start()
+            try:
+                batches.close()
+            finally:
+                release.set()
+                timer.cancel()
+                timer.join()
+        self.assertEqual(finished_at_shutdown, [6])
+        self.assertEqual(starts.value, 6)
+        self.assertEqual(loader.batches_processed, 1)
+        self.assert_closed(workers)
+
     def test_active_epoch_cannot_be_overwritten(self):
         """Reject overlapping iterators/reshuffle without damaging the active epoch."""
         loader = self.loader()

@@ -141,6 +141,50 @@ def _initialize_worker_with_affinity(worker_id: int, *, cpus: tuple[int, ...]) -
     logger.info("DataLoader worker %d CPU affinity: %s", worker_id, sorted(cpus))
 
 
+def _drain_worker_iterator(iterator: Any, stop: Any) -> None:
+    """Drain worker results and pending reads before PyTorch closes the queues."""
+    try:
+        if iterator._shutdown:
+            return
+        # Keep pinning and reconstructing queued tensors until workers
+        # acknowledge the stop. A worker may still be inside a GET.
+        iterator._try_put_index = lambda: None
+        stop.set()
+        original_timeout = iterator._timeout
+        iterator._timeout = _WORKER_DRAIN_TIMEOUT_SECONDS
+        try:
+            while True:
+                received = iterator._rcvd_idx
+                try:
+                    next(iterator)
+                except StopIteration:
+                    break
+                except Exception:
+                    if iterator._rcvd_idx == received:
+                        logger.warning(
+                            "DataLoader drain stalled during close",
+                            exc_info=True,
+                        )
+                        break
+                    # A failed prefetched batch was consumed. Keep
+                    # draining other workers without replaying its error.
+        finally:
+            iterator._timeout = original_timeout
+    finally:
+        try:
+            iterator._shutdown_workers()
+        finally:
+            for worker in iterator._workers:
+                worker.join(timeout=5)
+                if worker.is_alive():
+                    logger.warning(
+                        "Killing stalled DataLoader worker %s", worker.pid
+                    )
+                    worker.kill()
+                    worker.join(timeout=5)
+
+
+
 class OlmoEarthDataLoader(DataLoaderBase):
     """OlmoEarth Pretrain dataloader.
 
@@ -476,11 +520,8 @@ class OlmoEarthDataLoader(DataLoaderBase):
         )
 
     def __iter__(self) -> Iterator[Any]:
-        """Propagate generator close to the managed runtime on the opt-in path."""
-        if not self._can_reuse_workers():
-            yield from super().__iter__()
-            return
-        batches = self._iter_reused_batches()
+        """Count consumed batches and release the iterator on early exit."""
+        batches = self._iter_batches()
         try:
             for batch in batches:
                 self.batches_processed += 1
@@ -495,17 +536,23 @@ class OlmoEarthDataLoader(DataLoaderBase):
             )
         return _worker_ignore_sigterm
 
-    def _iter_batches(self) -> Iterable[OlmoEarthSample]:
+    def _iter_batches(self) -> Generator[Any, None, None]:
         """Iterate over the dataset in batches."""
         if self._can_reuse_workers():
-            return self._iter_reused_batches()
+            yield from self._iter_reused_batches()
+            return
         # Keep the original construction and RNG path for the default, zero-worker
         # and in-memory modes. An existing persistent runtime cannot follow them.
         if self._torch_loader is not None:
             self.close()
         pin_memory = self.target_device_type == "cuda" and self.num_workers > 0
+        stop = (
+            mp.get_context(self.multiprocessing_context).Event()
+            if self.num_workers > 0
+            else None
+        )
         loader = torch.utils.data.DataLoader(
-            _IterableDatasetWrapper(self),
+            _IterableDatasetWrapper(self, stop_event=stop),
             batch_size=None,
             num_workers=self.num_workers,
             pin_memory=pin_memory,
@@ -520,7 +567,15 @@ class OlmoEarthDataLoader(DataLoaderBase):
             worker_init_fn=self._worker_init_fn() if self.num_workers > 0 else None,
             timeout=0,
         )
-        return map(_unwrap_masked_view_batch, loader) if pin_memory else loader
+        if stop is None:
+            yield from loader
+            return
+        iterator = iter(loader)
+        try:
+            for batch in iterator:
+                yield _unwrap_masked_view_batch(batch) if pin_memory else batch
+        finally:
+            _drain_worker_iterator(iterator, stop)
 
     def _worker_configuration(self) -> tuple:
         """Identify settings that require a cold worker restart when changed.
@@ -654,43 +709,7 @@ class OlmoEarthDataLoader(DataLoaderBase):
         self._runtime_generation += 1
         iterator = getattr(loader, "_iterator", None)
         if iterator is not None:
-            try:
-                # Keep pinning and reconstructing queued tensors until workers
-                # acknowledge the stop. A worker may still be inside a GET.
-                iterator._try_put_index = lambda: None
-                stop.set()
-                original_timeout = iterator._timeout
-                iterator._timeout = _WORKER_DRAIN_TIMEOUT_SECONDS
-                try:
-                    while True:
-                        received = iterator._rcvd_idx
-                        try:
-                            next(iterator)
-                        except StopIteration:
-                            break
-                        except Exception:
-                            if iterator._rcvd_idx == received:
-                                logger.warning(
-                                    "DataLoader drain stalled during close",
-                                    exc_info=True,
-                                )
-                                break
-                            # A failed prefetched batch was consumed. Keep
-                            # draining other workers without replaying its error.
-                finally:
-                    iterator._timeout = original_timeout
-            finally:
-                try:
-                    iterator._shutdown_workers()
-                finally:
-                    for worker in iterator._workers:
-                        worker.join(timeout=5)
-                        if worker.is_alive():
-                            logger.warning(
-                                "Killing stalled DataLoader worker %s", worker.pid
-                            )
-                            worker.kill()
-                            worker.join(timeout=5)
+            _drain_worker_iterator(iterator, stop)
 
     @property
     def worker_info(self):  # type: ignore
