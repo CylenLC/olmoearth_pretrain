@@ -76,6 +76,7 @@ from olmoearth_pretrain.train.callbacks.evaluator_callback import (
     define_checkpoint_step_metrics,
     eval_result_log_dict,
 )
+from olmoearth_pretrain.train.callbacks.mlflow import OlmoEarthMLflowCallback
 
 logger = logging.getLogger(__name__)
 
@@ -150,70 +151,90 @@ def evaluate_checkpoints(
     if not isinstance(eval_callback, DownstreamEvaluatorCallback):
         raise ValueError("downstream_evaluator callback not found or disabled")
 
-    for step_num, step_path in checkpoints:
-        logger.info(f"=== Evaluating checkpoint step {step_num}: {step_path} ===")
+    mlflow_callbacks = [
+        callback
+        for callback in trainer.callbacks.values()
+        if isinstance(callback, OlmoEarthMLflowCallback)
+    ]
+    try:
+        for callback in mlflow_callbacks:
+            callback.config = config_dict
+            callback.pre_train()
 
-        # Load model weights from the distributed checkpoint
-        train_module_dir = os.path.join(step_path, "model_and_optim")
-        load_model_and_optim_state(train_module_dir, model)
-        model.to(device)
+        for step_num, step_path in checkpoints:
+            logger.info(f"=== Evaluating checkpoint step {step_num}: {step_path} ===")
 
-        for evaluator in eval_callback.evaluators:
-            if not eval_callback._check_supported_modalities(evaluator):
-                logger.info(
-                    f"  Skipping {evaluator.evaluation_name} (unsupported modalities)"
-                )
-                continue
-            if not eval_callback._check_input_requirements(evaluator):
-                logger.info(
-                    f"  Skipping {evaluator.evaluation_name} (input requirements)"
-                )
-                continue
+            # Load model weights from the distributed checkpoint
+            train_module_dir = os.path.join(step_path, "model_and_optim")
+            load_model_and_optim_state(train_module_dir, model)
+            model.to(device)
 
-            start_time = time.monotonic()
-            result = evaluator.val()
-            eval_time = time.monotonic() - start_time
-
-            val_result = result.val_result
-            test_result = result.test_result
-            metrics: dict[str, float | int] = {CHECKPOINT_STEP_METRIC: step_num}
-
-            if val_result is not None:
-                metrics.update(
-                    eval_result_log_dict("eval", evaluator.evaluation_name, val_result)
-                )
-
-            if eval_callback.run_on_test and test_result is not None:
-                metrics.update(
-                    eval_result_log_dict(
-                        "eval/test", evaluator.evaluation_name, test_result
+            for evaluator in eval_callback.evaluators:
+                if not eval_callback._check_supported_modalities(evaluator):
+                    logger.info(
+                        f"  Skipping {evaluator.evaluation_name} (unsupported modalities)"
                     )
+                    continue
+                if not eval_callback._check_input_requirements(evaluator):
+                    logger.info(
+                        f"  Skipping {evaluator.evaluation_name} (input requirements)"
+                    )
+                    continue
+
+                start_time = time.monotonic()
+                result = evaluator.val()
+                eval_time = time.monotonic() - start_time
+
+                val_result = result.val_result
+                test_result = result.test_result
+                metrics: dict[str, float | int] = {CHECKPOINT_STEP_METRIC: step_num}
+
+                if val_result is not None:
+                    metrics.update(
+                        eval_result_log_dict(
+                            "eval", evaluator.evaluation_name, val_result
+                        )
+                    )
+
+                if eval_callback.run_on_test and test_result is not None:
+                    metrics.update(
+                        eval_result_log_dict(
+                            "eval/test", evaluator.evaluation_name, test_result
+                        )
+                    )
+
+                if result.embedding_diagnostics:
+                    for k, v in result.embedding_diagnostics.items():
+                        metrics[
+                            f"eval_embed_diagnostics/{evaluator.evaluation_name}/{k}"
+                        ] = v
+
+                metrics[f"eval_time/{evaluator.evaluation_name}"] = eval_time
+                result.eval_time = eval_time
+                eval_callback._log_eval_results_to_mlflow(
+                    evaluator, result, step=step_num, metrics=metrics
                 )
 
-            if result.embedding_diagnostics:
-                for k, v in result.embedding_diagnostics.items():
-                    metrics[
-                        f"eval_embed_diagnostics/{evaluator.evaluation_name}/{k}"
-                    ] = v
-
-            metrics[f"eval_time/{evaluator.evaluation_name}"] = eval_time
-
-            logger.info(
-                f"  {evaluator.evaluation_name}: "
-                f"val={val_result.primary if val_result else 'N/A'}, "
-                f"test={test_result.primary if test_result else 'N/A'} "
-                f"({eval_time:.1f}s)"
-            )
-
-            if wandb_callback.enabled and get_rank() == 0:
-                wandb_callback.wandb.log(metrics)
                 logger.info(
-                    f"Logged {len(metrics)} metrics for "
-                    f"{evaluator.evaluation_name} at step {step_num}"
+                    f"  {evaluator.evaluation_name}: "
+                    f"val={val_result.primary if val_result else 'N/A'}, "
+                    f"test={test_result.primary if test_result else 'N/A'} "
+                    f"({eval_time:.1f}s)"
                 )
 
-        gc.collect()
-        torch.cuda.empty_cache()
+                if wandb_callback.enabled and get_rank() == 0:
+                    wandb_callback.wandb.log(metrics)
+                    logger.info(
+                        f"Logged {len(metrics)} metrics for "
+                        f"{evaluator.evaluation_name} at step {step_num}"
+                    )
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    finally:
+        for callback in mlflow_callbacks:
+            callback.close()
 
     if wandb_callback.enabled and get_rank() == 0:
         wandb_callback.wandb.finish()

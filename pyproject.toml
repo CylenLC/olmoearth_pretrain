@@ -73,6 +73,12 @@ explicit = true
 
 [project.optional-dependencies]
 oss = ["s3fs==2025.12.0", "boto3>=1.40.49,<1.41"]
+mlflow = [
+    # Tracking client only; the server is deployed separately.
+    "mlflow-skinny>=2.22.5,<3",
+    "psutil>=7.1.1",
+    "nvidia-ml-py>=12",
+]
 training = [
     "ai2-olmo-core==2.6.0",
     "albumentations>=1.4.10",

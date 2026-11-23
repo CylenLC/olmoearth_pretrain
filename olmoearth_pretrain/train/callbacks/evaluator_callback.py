@@ -1220,6 +1220,48 @@ class DownstreamEvaluatorCallback(Callback):
             None,
         )
 
+    def _log_eval_results_to_mlflow(
+        self,
+        evaluator: DownstreamEvaluator,
+        result: EvalTaskResult,
+        *,
+        step: int,
+        metrics: dict[str, float] | None = None,
+    ) -> None:
+        """Attach existing evaluation outputs without running extra evaluation.
+
+        In-loop metrics already flow through ``Trainer.record_metric``. Only
+        callers that bypass the trainer's metric loop (checkpoint sweeps) supply
+        ``metrics`` here, avoiding duplicate points in the training run.
+        """
+        if get_rank() != 0:
+            return
+
+        from olmoearth_pretrain.train.callbacks.mlflow import OlmoEarthMLflowCallback
+
+        for callback in self.trainer._iter_callbacks():
+            if isinstance(callback, OlmoEarthMLflowCallback) and callback.enabled:
+                # Select task fields explicitly: evaluator.__dict__ also contains
+                # the model, trainer, and data-related runtime objects.
+                task_config = {
+                    item.name: getattr(evaluator, item.name)
+                    for item in dataclasses.fields(DownstreamTaskConfig)
+                    if hasattr(evaluator, item.name)
+                }
+                callback.log_evaluation(
+                    evaluator.evaluation_name,
+                    metrics or {},
+                    config={
+                        "task": task_config,
+                        "dataset": dataclasses.asdict(evaluator.config),
+                        "run_on_test": self.run_on_test,
+                        "n_bootstrap": self.n_bootstrap,
+                        "bootstrap_seed": self.bootstrap_seed,
+                    },
+                    results=dataclasses.asdict(result),
+                    step=step,
+                )
+
     def _permanent_save_interval(self) -> int | None:
         """Permanent-checkpoint interval (in steps) of the trainer's checkpointer.
 
@@ -1428,6 +1470,7 @@ class DownstreamEvaluatorCallback(Callback):
         )
 
         result.eval_time = eval_time
+        self._log_eval_results_to_mlflow(evaluator, result, step=self.step)
         return result
 
 
