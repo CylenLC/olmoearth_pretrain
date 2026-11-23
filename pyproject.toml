@@ -75,7 +75,7 @@ explicit = true
 oss = ["s3fs==2025.12.0", "boto3>=1.40.49,<1.41"]
 mlflow = [
     # Tracking client only; the server is deployed separately.
-    "mlflow-skinny>=2.22.5,<3",
+    "mlflow-skinny==3.18.0",
     "psutil>=7.1.1",
     "nvidia-ml-py>=12",
 ]

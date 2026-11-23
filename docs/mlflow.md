@@ -2,7 +2,7 @@
 
 基于官方 `upstream/main`：`6583a536c428ad004bb3c223add0576087d67e92`。
 OLMo-core 保持 2.6.0，锁定的 PyTorch 保持 2.9.1。新增可选依赖为
-`mlflow-skinny>=2.22.5,<3`、psutil 和 nvidia-ml-py；本仓库不部署服务端。
+`mlflow-skinny==3.18.0`、psutil 和 nvidia-ml-py；本仓库不部署服务端。
 
 ## 安装与连接
 

@@ -45,6 +45,7 @@ def tracking(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     import mlflow
     from mlflow import MlflowClient
 
+    monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
     old_uri = mlflow.get_tracking_uri()
     while mlflow.active_run() is not None:
         mlflow.end_run()
