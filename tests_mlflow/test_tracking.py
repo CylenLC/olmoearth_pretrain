@@ -695,3 +695,65 @@ def test_resume_rejects_different_server(
         callback.pre_train()
     callback.on_error(RuntimeError("server mismatch"))
     callback.close()
+
+
+def test_disabled_resume_preserves_identity(module, tmp_path):
+    """A temporary tracking outage/disable must not fork the subsequent run."""
+    state = {"run_id": "original", "tracking_uri": "http://localhost:5000"}
+    callback = attach(module.OlmoEarthMLflowCallback(enabled=False), tmp_path)
+    callback.load_state_dict(state)
+    assert callback.state_dict() == state
+
+
+def test_structured_secrets_are_redacted(module):
+    """Argument arrays and case-varied environment records carry credentials."""
+    clean = module.sanitize(
+        {
+            "args": ["--password", "secret-one", "--api-key", "secret-two"],
+            "record": {"Name": "AWS_SECRET_ACCESS_KEY", "Value": "secret-three"},
+        }
+    )
+    assert "secret-" not in json.dumps(clean)
+
+
+def test_out_of_order_checkpoint_completion(module, tracking, tmp_path):
+    """An older async completion must not replace the latest checkpoint tag."""
+    callback = attach(
+        module.OlmoEarthMLflowCallback(enabled=True, system_metrics=False), tmp_path
+    )
+    callback.pre_train()
+    callback.post_checkpoint_saved("oss://bucket/step20")
+    callback.post_checkpoint_saved("oss://bucket/step10")
+    finish(callback)
+    run = tracking.client.get_run(callback.run_id)
+    assert run.data.tags["olmoearth.checkpoint_uri"] == "oss://bucket/step20"
+    assert len(tracking.client.list_artifacts(callback.run_id, "checkpoints")) == 2
+
+
+def test_async_failure_surfaces_on_training_thread(
+    module, tracking, tmp_path, monkeypatch
+):
+    """A swallowed Future notification exception remains visible to post_step."""
+    from concurrent.futures import Future
+
+    callback = attach(
+        module.OlmoEarthMLflowCallback(
+            enabled=True, system_metrics=False, failure_policy="raise"
+        ),
+        tmp_path,
+    )
+    callback.pre_train()
+
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("secret-error-body")
+
+    monkeypatch.setattr(callback._client, "log_dict", unavailable)
+    future = Future()
+    future.add_done_callback(
+        lambda _: callback.post_checkpoint_saved("oss://bucket/step10")
+    )
+    future.set_result(None)
+    with pytest.raises(RuntimeError, match="ConnectionError"):
+        callback.post_step()
+    callback.on_error(RuntimeError("training stopped"))
+    callback.close()

@@ -79,10 +79,13 @@ def sanitize(value: Any) -> Any:
     """Return JSON-safe metadata with credentials and signed URL queries removed."""
     if isinstance(value, Mapping):
         # Support name/value forms used by environment and secret configurations.
-        if any(_sensitive(str(value.get(key, ""))) for key in ("name", "key")):
+        if any(
+            str(k).lower() in {"name", "key"} and _sensitive(str(v))
+            for k, v in value.items()
+        ):
             return {
                 str(k): "[REDACTED]"
-                if k == "value" or _sensitive(str(k))
+                if str(k).lower() == "value" or _sensitive(str(k))
                 else sanitize(v)
                 for k, v in value.items()
             }
@@ -91,7 +94,15 @@ def sanitize(value: Any) -> Any:
             for k, v in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [sanitize(v) for v in value]
+        result = []
+        redact_next = False
+        for item in value:
+            result.append("[REDACTED]" if redact_next else sanitize(item))
+            redact_next = isinstance(item, str) and (
+                (item.startswith("--") and _sensitive(item))
+                or item.lower().rstrip(":") in {"authorization", "bearer", "basic"}
+            )
+        return result
     if isinstance(value, (str, Path)):
         return _clean_string(str(value))
     if value is None or isinstance(value, (bool, int)):
@@ -170,6 +181,7 @@ class OlmoEarthMLflowCallback(Callback):
         self._last_logged_step = None
         self._metrics_by_step = OrderedDict()
         self._checkpoint_metrics = {}
+        self._latest_checkpoint_step = -1
         # TrainerConfig.with_callback() deep-copies callbacks before attaching
         # them. Create the unpicklable lock only once training actually starts.
         self._lock = None
@@ -204,7 +216,7 @@ class OlmoEarthMLflowCallback(Callback):
 
     def state_dict(self) -> dict[str, Any]:
         """Persist identity through the existing Trainer checkpoint state."""
-        if self.enabled and get_rank() == 0:
+        if get_rank() == 0 and (self.enabled or self.run_id):
             with self._get_lock():
                 if self._trainer is not None and self._client is not None:
                     self._checkpoint_metrics[self.step] = dict(
@@ -218,7 +230,11 @@ class OlmoEarthMLflowCallback(Callback):
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Resume the checkpoint's run; an explicit different ID is an error."""
-        if not self.enabled or get_rank() != 0:
+        if get_rank() != 0:
+            return
+        if not self.enabled:
+            self.run_id = state_dict.get("run_id") or self.run_id
+            self._resume_uri = state_dict.get("tracking_uri")
             return
 
         def restore() -> None:
@@ -269,14 +285,18 @@ class OlmoEarthMLflowCallback(Callback):
         mlflow.set_tracking_uri(self._resolved_uri)
         resumed = bool(self.run_id)
         if not self.run_id:
-            experiment = self._client.get_experiment_by_name(self.experiment_name)
+            experiment = self._client.get_experiment_by_name(
+                sanitize(self.experiment_name)
+            )
             if experiment is None:
                 try:
-                    experiment_id = self._client.create_experiment(self.experiment_name)
+                    experiment_id = self._client.create_experiment(
+                        sanitize(self.experiment_name)
+                    )
                 except Exception:
                     # Another training job may have created this experiment first.
                     experiment = self._client.get_experiment_by_name(
-                        self.experiment_name
+                        sanitize(self.experiment_name)
                     )
                     if experiment is None:
                         raise
@@ -457,9 +477,11 @@ class OlmoEarthMLflowCallback(Callback):
                 },
                 f"checkpoints/step{step}.json",
             )
-            self._client.set_tag(
-                self.run_id, "olmoearth.checkpoint_uri", sanitize(str(path))
-            )
+            if step >= self._latest_checkpoint_step:
+                self._client.set_tag(
+                    self.run_id, "olmoearth.checkpoint_uri", sanitize(str(path))
+                )
+                self._latest_checkpoint_step = step
             self._write_metrics(step, {"checkpoint/step": step})
 
         self._guard(record)
@@ -478,7 +500,7 @@ class OlmoEarthMLflowCallback(Callback):
             if self._client is None:
                 return
             eval_step = self.step if step is None else step
-            safe_name = re.sub(r"[^\w.-]", "_", name).strip(".")[:100] or "evaluation"
+            safe_name = "task"
             safe_name += "-" + hashlib.sha256(name.encode()).hexdigest()[:8]
             self._artifact(
                 {

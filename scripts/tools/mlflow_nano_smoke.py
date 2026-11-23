@@ -70,7 +70,7 @@ def main() -> None:
         "--data_loader.sampled_hw_p_list=[4]",
         "--data_loader.tile_size=8",
         "--data_loader.max_timesteps=2",
-        "--data_loader.token_budget=32",
+        "--data_loader.token_budget=1024",
         "--train_module.rank_microbatch_size=2",
         "--trainer.no_evals=true",
         "--trainer.async_bookkeeping=false",
